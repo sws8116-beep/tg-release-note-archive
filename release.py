@@ -5,7 +5,7 @@ import pandas as pd
 import re
 import os
 
-# --- 1. 페이지 스타일 및 레이아웃 설정 ---
+# --- 1. 페이지 스타일 및 레이아웃 ---
 st.set_page_config(page_title="보안팀 릴리즈 아카이브 Pro", layout="wide")
 
 st.markdown("""
@@ -25,7 +25,7 @@ st.markdown("""
     </style>
     """, unsafe_allow_html=True)
 
-# --- 2. DB 연결 설정 ---
+# --- 2. DB 연결 및 테이블 설정 ---
 DB_FILE = 'security_notes_archive.db'
 
 def get_connection():
@@ -33,45 +33,34 @@ def get_connection():
 
 conn = get_connection()
 cursor = conn.cursor()
+# 버전(version) 컬럼에 UNIQUE 제약 조건을 걸거나 로직에서 체크합니다.
 cursor.execute('''CREATE TABLE IF NOT EXISTS notes 
                   (id INTEGER PRIMARY KEY AUTOINCREMENT, 
                    version TEXT, openssl TEXT, openssh TEXT, 
                    improvements TEXT, issues TEXT, raw_text TEXT)''')
 conn.commit()
 
-# --- 3. [개선] 문장 잘림 방지 정제 함수 ---
+# --- 3. 정제 함수 및 유틸리티 ---
 def clean_format(section_text):
     if not section_text: return ""
-    # 1. 모든 줄바꿈과 불필요한 공백을 하나로 합침 (문장 잘림 방지 핵심)
     text = re.sub(r'\s+', ' ', section_text).strip()
-    
-    # 2. 대괄호 '[' 가 시작되는 지점을 기준으로 나눔
-    # 예: "[모듈] 설명 [모듈2] 설명" -> ["", "[", "모듈] 설명 ", "[", "모듈2] 설명"]
     parts = re.split(r'(\[)', text)
-    
     formatted_lines = []
-    # 대괄호 전 문구가 있다면 추가
-    if parts[0].strip():
-        formatted_lines.append(f"* {parts[0].strip()}")
-        
+    if parts[0].strip(): formatted_lines.append(f"* {parts[0].strip()}")
     for i in range(1, len(parts), 2):
-        bracket = parts[i] # '['
+        bracket = parts[i]
         content = parts[i+1] if i+1 < len(parts) else ""
-        # 대괄호 내부와 상세 설명을 하나의 리스트 항목으로 결합
-        line = f"* {bracket}{content.strip()}"
-        formatted_lines.append(line)
-        
+        formatted_lines.append(f"* {bracket}{content.strip()}")
     return "\n".join(formatted_lines)
 
-# --- 4. 검색어 리셋 함수 ---
 def reset_search():
     st.session_state.search_input = ""
     st.session_state.search_key = str(os.urandom(5))
 
 if 'search_key' not in st.session_state:
-    st.session_state.search_key = "first_run"
+    st.session_state.search_key = "v18"
 
-# --- 5. 사이드바 구성 ---
+# --- 4. 사이드바 구성 ---
 with st.sidebar:
     st.header("📜 버전 히스토리")
     history_df = pd.read_sql_query("SELECT version FROM notes ORDER BY version DESC", conn)
@@ -85,6 +74,7 @@ with st.sidebar:
     st.markdown("<br><br>", unsafe_allow_html=True)
     st.divider()
     
+    # [기능 1] 중복 방지 PDF 등록
     with st.expander("➕ PDF 신규 등록", expanded=False):
         files = st.file_uploader("파일 선택", accept_multiple_files=True, label_visibility="collapsed")
         if st.button("✅ DB 반영", use_container_width=True):
@@ -94,6 +84,13 @@ with st.sidebar:
                         raw = "\n".join([p.extract_text() for p in pdf.pages if p.extract_text()])
                     v_match = re.search(r'TrusGuard\s+([\d\.]+)', raw)
                     version = v_match.group(1) if v_match else "Unknown"
+                    
+                    # 중복 체크 로직 추가
+                    cursor.execute("SELECT version FROM notes WHERE version = ?", (version,))
+                    if cursor.fetchone():
+                        st.warning(f"⚠️ {version} 버전은 이미 존재합니다. 건너뜁니다.")
+                        continue
+
                     openssl = re.search(r'OpenSSL\s+([\d\.]+[\w]*)', raw)
                     openssh = re.search(r'OpenSSH\s+([\d\.]+p\d+)', raw)
                     imp = re.search(r'Improvement(.*?)(Issue|$|5\.)', raw, re.DOTALL)
@@ -106,8 +103,18 @@ with st.sidebar:
                 st.success("반영 완료!")
                 st.rerun()
 
+    # [기능 2] 잘못된 데이터 삭제
+    with st.expander("🗑️ 데이터 삭제", expanded=False):
+        if not history_df.empty:
+            del_version = st.selectbox("삭제할 버전 선택", history_df['version'].tolist())
+            if st.button("🚨 선택한 버전 삭제", use_container_width=True):
+                cursor.execute("DELETE FROM notes WHERE version = ?", (del_version,))
+                conn.commit()
+                st.error(f"✅ {del_version} 버전이 삭제되었습니다.")
+                st.rerun()
+
+    # [기능 3] 시스템 관리
     with st.expander("💾 시스템 관리", expanded=False):
-        st.markdown("<p class='small-font'>DB 백업/복구</p>", unsafe_allow_html=True)
         if os.path.exists(DB_FILE):
             with open(DB_FILE, "rb") as f:
                 st.download_button("📥 DB 다운로드", f, file_name="backup.db", mime="application/octet-stream")
@@ -119,17 +126,13 @@ with st.sidebar:
             st.success("교체 완료!")
             st.rerun()
 
-# --- 6. 메인 화면 및 검색바 정렬 (v17.2 수정) ---
+# --- 5. 메인 화면 ---
 st.title("🛡️ TrusGuard 통합 릴리즈 관제센터")
 
-# 검색바와 초기화 버튼을 바닥선 기준으로 일직선 정렬
 col1, col2 = st.columns([5, 1], vertical_alignment="bottom")
-
 with col1:
     keyword = st.text_input("검색어 입력", placeholder="예: VPN 접속", key=st.session_state.search_key)
-
 with col2:
-    # 초기화 버튼 클릭 시 reset_search 함수 실행
     st.button("🔄 초기화", use_container_width=True, on_click=reset_search)
 
 def highlight_text(text, kws):
@@ -138,7 +141,6 @@ def highlight_text(text, kws):
         text = re.sub(f"({re.escape(k)})", r"<mark class='highlight'>\1</mark>", text, flags=re.IGNORECASE)
     return text.replace("\n", "<br>")
 
-# --- 7. 통합 검색 결과 또는 개별 상세 내용 출력 ---
 if keyword:
     kws = keyword.split()
     query = "SELECT version, improvements, issues FROM notes WHERE "
@@ -155,11 +157,9 @@ if keyword:
             st.markdown(f"<div class='report-card'>{highlight_text(display_text, kws)}</div>", unsafe_allow_html=True)
     else:
         st.error("검색 결과가 없습니다.")
-
 elif selected_version:
     res = pd.read_sql_query("SELECT * FROM notes WHERE version = ?", conn, params=[selected_version]).iloc[0]
     st.markdown(f"<div class='version-title'>📋 TrusGuard {res['version']} 전체 리포트</div>", unsafe_allow_html=True)
-    
     full_content = f"""
     <div class='report-card'>
         <span class='sub-label'>🔒 보안 컴포넌트</span>
