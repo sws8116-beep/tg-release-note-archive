@@ -6,7 +6,7 @@ import re
 import os
 
 # --- 1. 페이지 설정 ---
-st.set_page_config(page_title="보안팀 릴리즈 아카이브 Pro v35.6", layout="wide")
+st.set_page_config(page_title="보안팀 릴리즈 아카이브 Pro v35.7", layout="wide")
 
 st.markdown("""
     <style>
@@ -25,32 +25,39 @@ cursor = conn.cursor()
 cursor.execute('''CREATE TABLE IF NOT EXISTS notes (id INTEGER PRIMARY KEY AUTOINCREMENT, version TEXT, openssl TEXT, openssh TEXT, improvements TEXT, issues TEXT, raw_text TEXT)''')
 conn.commit()
 
-# --- 3. [통합 엔진] 문장 병합 및 정규화 강화 ---
-def clean_text_v35(text):
+# --- 3. [통합 엔진] 문장 복원 파싱 ---
+def robust_clean_text(text):
     """
-    텍스트 내의 줄바꿈과 불필요한 공백을 제거하고
-    끊긴 문장을 하나로 합칩니다.
+    여러 줄로 쪼개진 텍스트를 하나의 문장으로 복원합니다.
     """
     if not text: return ""
-    # 1. 줄바꿈을 공백으로 변환
+    
+    # 1. 줄바꿈을 공백으로 변환 (문장 이어 붙이기)
     text = text.replace('\n', ' ')
-    # 2. 다중 공백을 단일 공백으로 축소
+    
+    # 2. 괄호 끊김 보정 (예: "( d" -> "(d")
+    text = re.sub(r'\(\s+', '(', text)
+    text = re.sub(r'\s+\)', ')', text)
+    
+    # 3. 다중 공백 제거
     text = re.sub(r'\s+', ' ', text)
+    
     return text.strip()
 
 def parse_pdf_v35(file):
     with pdfplumber.open(file) as pdf:
         full_raw = ""
-        extracted_data = [] # 순서 유지용 리스트
+        extracted_data = [] 
         
         for page in pdf.pages:
             p_text = page.extract_text() or ""
             full_raw += p_text + "\n"
             
-            # [전략 1 & 2] 표(Table) 추출
+            # [전략] 표 추출 (옵션 완화)
+            # snap_tolerance를 높여서 표 인식률 향상
             strategies = [
-                {}, 
-                {"vertical_strategy": "text", "horizontal_strategy": "text", "snap_tolerance": 5}
+                {"vertical_strategy": "lines", "horizontal_strategy": "lines", "snap_tolerance": 5},
+                {"vertical_strategy": "text", "horizontal_strategy": "text", "snap_tolerance": 8}
             ]
             
             for settings in strategies:
@@ -62,15 +69,15 @@ def parse_pdf_v35(file):
                 
                 for table in tables:
                     for row in table:
-                        # [핵심] 셀 데이터 전처리 (줄바꿈 제거)
-                        cells = [clean_text_v35(str(c)) if c else "" for c in row]
+                        # 전처리 없이 원본 셀 데이터 가져오기 (나중에 합침)
+                        cells = [str(c).strip() if c else "" for c in row]
                         
                         if not cells or len(cells) < 2: continue
                         if cells[0] in ["구분", "Type", "분류"] or cells[1] in ["항목", "기능분류"]: continue
 
                         v_type = cells[0]
                         v_cat = cells[1] if len(cells) > 1 else ""
-                        v_desc_raw = cells[2] if len(cells) > 2 else "" # 이미 clean_text로 한 줄이 됨
+                        v_desc_raw = cells[2] if len(cells) > 2 else "" 
                         v_id = cells[3] if len(cells) > 3 else ""
 
                         # Forward Fill
@@ -81,19 +88,16 @@ def parse_pdf_v35(file):
                         else: v_cat = last_cat
 
                         target_keywords = ['개선', '신규', '이슈', '수정', 'BUG', 'TASK', 'Feature', '기능']
+                        
                         if v_desc_raw and any(k in v_type for k in target_keywords):
-                            # 스마트 요약: 제목(진하게 된 부분 등) 제거 시도
-                            # '•' 등으로 시작하는 패턴이 있으면 그것만 추출
-                            # clean_text가 이미 줄바꿈을 없앴으므로 패턴 매칭이 쉬워짐
+                            # [핵심 변경] 제목/내용 분리하지 않고 통째로 이어 붙임
+                            # 불렛(•) 기호만 제거하고 나머지는 그대로 유지
                             
-                            # 정규식: (• 또는 - 또는 o) 뒤에 오는 내용 추출
-                            # 예: "제목 • 내용1 • 내용2" -> ["내용1", "내용2"]
-                            bullets = re.findall(r'[•\-o]\s*([^•\-o]+)', v_desc_raw)
+                            # 1. 불렛 기호 제거
+                            cleaned_desc = re.sub(r'[•\-o]\s*', '', v_desc_raw)
                             
-                            if bullets:
-                                final_desc = " / ".join([b.strip() for b in bullets])
-                            else:
-                                final_desc = v_desc_raw # 불렛 없으면 통째로 사용
+                            # 2. 문장 복원 (줄바꿈 제거 및 공백 정리)
+                            final_desc = robust_clean_text(cleaned_desc)
 
                             cat_part = f" {v_cat}" if v_cat else ""
                             id_part = f" ({v_id})" if v_id and v_id.lower() not in ["none", "", "-"] else ""
@@ -103,14 +107,13 @@ def parse_pdf_v35(file):
                             if line_str not in extracted_data:
                                 extracted_data.append(line_str)
             
-            # [전략 3] 텍스트 라인 파싱 (보완)
+            # [보조 전략] 텍스트 라인 파싱
             text_lines = p_text.split('\n')
             for l in text_lines:
-                clean_l = clean_text_v35(l) # 여기서도 공백 정리
+                clean_l = robust_clean_text(l)
                 if not clean_l: continue
 
                 match_bracket = re.match(r'^[•\-]?\s*\[([^\]]+)\]\s*(.*)', clean_l)
-                
                 if match_bracket:
                     tag, body = match_bracket.group(1), match_bracket.group(2)
                     if any(kw in tag for kw in ['개선', '신규', '이슈', '수정', 'BUG']):
@@ -178,7 +181,7 @@ with st.sidebar:
                 st.rerun()
 
 # --- 5. 메인 렌더링 ---
-st.title("🛡️ TrusGuard 통합 관제 (v35.6)")
+st.title("🛡️ TrusGuard 통합 관제 (v35.7)")
 
 c1, c2 = st.columns([5,1], vertical_alignment="bottom")
 keyword = c1.text_input("검색어 입력", key=st.session_state.s_key)
