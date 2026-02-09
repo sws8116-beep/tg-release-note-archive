@@ -6,7 +6,7 @@ import re
 import os
 
 # --- 1. 페이지 설정 ---
-st.set_page_config(page_title="보안팀 릴리즈 아카이브 Pro v35.14", layout="wide")
+st.set_page_config(page_title="보안팀 릴리즈 아카이브 Pro v35.15", layout="wide")
 
 st.markdown("""
     <style>
@@ -33,7 +33,7 @@ def init_db():
 
 init_db()
 
-# --- 3. [통합 엔진] v35.14 (Raw Text Parsing) ---
+# --- 3. [통합 엔진] v35.15 (핀셋 파싱) ---
 
 def clean_text(text):
     if not text: return ""
@@ -54,107 +54,111 @@ def parse_pdf_v35(file):
         full_raw = ""
         extracted_data = [] 
         
-        # 전체 텍스트 수집 (페이지 구분 없이 통으로 처리)
+        # 1. 전체 텍스트 수집 (페이지 번호 등 잡음 제거)
         for page in pdf.pages:
             p_text = page.extract_text()
             if p_text:
+                # 페이지 번호 (예: 1/9) 제거
+                p_text = re.sub(r'\d+\s*/\s*\d+', '', p_text)
                 full_raw += p_text + "\n"
         
-        # --- [전략] 라인 기반 스캐닝 (Table 포기) ---
+        # 2. 라인 스캐닝
         lines = full_raw.split('\n')
         
         current_type = ""
         current_cat = ""
         current_desc = []
         
-        # 처리할 키워드 (시작점 식별자)
-        type_keywords = ['개선', '신규', '이슈', '수정', 'BUG', 'Feature', '기능', '↑', '+']
-        cat_keywords = ['System', 'SSL', 'VPN', 'Network', 'Dashboard', 'Log', 'IPSec', 'Policy']
+        # 유효 키워드 (이걸로 시작해야만 인정)
+        valid_start_keywords = ['[개선]', '[신규]', '[이슈]', '[수정]', '[BUG]', '↑', '+']
+        # 무시할 키워드 (이게 들어간 줄은 아예 버림)
+        ignore_keywords = ['[릴리즈노트]', '제약사항', '다운로드', '관련 문서', 'Build', 'Last Updated', 'http', 'TrusGuard_']
         
         for line in lines:
             line = line.strip()
             if not line: continue
             
-            # 1. 새 항목의 시작인지 검사
-            #    패턴: [유형] 혹은 아이콘(↑, +)으로 시작하거나, 카테고리(System)가 맨 앞에 오는 경우
+            # [필터링] 쓰레기 데이터 스킵
+            if any(k in line for k in ignore_keywords): continue
             
-            # (1) 명시적 태그 [개선] ...
-            tag_match = re.match(r'^[•\-]?\s*\[([^\]]+)\]\s*(.*)', line)
+            # 새 항목 감지
+            # 1) 대괄호 태그로 시작: [개선] ...
+            tag_match = re.match(r'^[•\-]?\s*(\[[^\]]+\])\s*(.*)', line)
             
-            # (2) 아이콘이나 단순 텍스트로 시작하는 경우 (테이블이 깨져서 줄바꿈 된 경우)
+            # 2) 아이콘으로 시작: ↑, +
+            icon_start = any(line.startswith(x) for x in ['↑', '+'])
+            
             is_new_start = False
             found_type = ""
+            rest_line = ""
             
             if tag_match:
+                tag = tag_match.group(1)
+                # 태그가 유효한지 검증 (릴리즈노트 같은거 거르기 위해)
+                if any(vk in tag for vk in valid_start_keywords) or '개선' in tag or '신규' in tag or '이슈' in tag:
+                    is_new_start = True
+                    found_type = tag
+                    rest_line = tag_match.group(2)
+            elif icon_start:
                 is_new_start = True
-                found_type = tag_match.group(1)
-                rest_line = tag_match.group(2)
-            else:
-                # 줄의 시작이 키워드 중 하나인지 확인
-                first_word = line.split()[0] if line.split() else ""
-                if any(k in first_word for k in type_keywords) or any(k in first_word for k in cat_keywords):
-                     is_new_start = True
-                     # 타입 추정 (키워드 매칭)
-                     if any(k in first_word for k in type_keywords):
-                         found_type = first_word
-                     else:
-                         found_type = "기타" # 카테고리로 시작하면 타입은 모름
-                     rest_line = line[len(first_word):].strip()
-                elif len(current_desc) > 0:
-                     # 시작이 아니면 이전 항목의 내용(Description)으로 이어 붙임
-                     current_desc.append(line)
-                     continue
-            
+                found_type = '[신규]' if line.startswith('+') else '[개선]'
+                rest_line = line[1:].strip() # 아이콘 제거 후 나머지
+
+            # 이전 항목 저장 로직
             if is_new_start:
-                # 이전 항목 저장
                 if current_desc:
                     full_desc = " ".join(current_desc)
-                    full_desc = repair_content(full_desc) # 내용 복구
+                    full_desc = repair_content(full_desc)
                     
-                    # 카테고리 추출 시도 (내용 앞부분에 영어가 있으면 카테고리로 간주)
-                    # 예: "System Apache..." -> Cat: System, Desc: Apache...
-                    detected_cat = ""
-                    
-                    # 이전 루프에서 유지된 카테고리 사용 or 새로 추출
-                    split_desc = full_desc.split(' ', 1)
-                    if len(split_desc) > 1 and any(c in split_desc[0] for c in cat_keywords):
-                        detected_cat = split_desc[0]
-                        final_desc = split_desc[1]
-                    else:
-                        detected_cat = current_cat # 앞선 항목의 카테고리 상속
-                        final_desc = full_desc
-
-                    # 필터링
-                    if len(final_desc) > 5 and not any(x in final_desc for x in ["Last Updated", "릴리즈노트", "페이지"]):
-                        # 아이콘 치환
-                        final_type = current_type.replace('↑', '개선').replace('+', '신규')
+                    # 너무 짧은 건 버림 (오탐 방지)
+                    if len(full_desc) > 5:
+                        # 카테고리 추출 (System Apache... -> Cat: System)
+                        # 영어로 시작하는 첫 단어를 카테고리로 간주 (휴리스틱)
+                        first_word = full_desc.split()[0] if full_desc else ""
+                        if re.match(r'^[A-Za-z]+$', first_word) and len(first_word) > 2:
+                            current_cat = first_word
+                            full_desc = full_desc[len(first_word):].strip()
                         
-                        cat_str = f" {detected_cat}" if detected_cat else ""
-                        formatted = f"[{final_type}]{cat_str} * {final_desc}"
+                        # Type 정규화
+                        final_type = current_type.replace('↑', '개선').replace('+', '신규').replace('[', '').replace(']', '')
+                        
+                        cat_str = f" {current_cat}" if current_cat else ""
+                        formatted = f"[{final_type}]{cat_str} * {full_desc}"
                         
                         if formatted not in extracted_data:
                             extracted_data.append(formatted)
 
-                # 상태 초기화 및 새 항목 시작
+                # 초기화
                 current_type = found_type
-                # 카테고리는 현재 줄에 있을 수도, 다음 줄에 있을 수도 있음. 일단 초기화 안하고 유지(Forward Fill)하거나 현재 줄에서 찾음
+                current_cat = "" # 카테고리 초기화 (새 항목이니까)
                 current_desc = [rest_line] if rest_line else []
+            
+            else:
+                # 시작이 아니면 내용 이어 붙이기
+                # 단, 이상한 메타데이터나 날짜 같은 건 제외
+                if current_desc and not re.match(r'^\d{4}\.', line): 
+                    current_desc.append(line)
         
-        # 마지막 항목 저장
+        # 마지막 항목 처리
         if current_desc:
             full_desc = " ".join(current_desc)
             full_desc = repair_content(full_desc)
-            final_type = current_type.replace('↑', '개선').replace('+', '신규')
-            formatted = f"[{final_type}] * {full_desc}"
-            extracted_data.append(formatted)
+            if len(full_desc) > 5:
+                first_word = full_desc.split()[0] if full_desc else ""
+                if re.match(r'^[A-Za-z]+$', first_word) and len(first_word) > 2:
+                    current_cat = first_word
+                    full_desc = full_desc[len(first_word):].strip()
+                
+                final_type = current_type.replace('↑', '개선').replace('+', '신규').replace('[', '').replace(']', '')
+                cat_str = f" {current_cat}" if current_cat else ""
+                formatted = f"[{final_type}]{cat_str} * {full_desc}"
+                extracted_data.append(formatted)
 
         # 메타데이터
         v = re.search(r'TrusGuard\s+v?([0-9\.]+)', full_raw, re.I)
         version = v.group(1) if v else "Unknown"
-        
         ssl_match = re.search(r'OpenSSL.*?(?:->\s*|\s)([\d\.]+[a-z]?)', full_raw, re.I)
         openssl = ssl_match.group(1) if ssl_match else "-"
-        
         ssh_match = re.search(r'OpenSSH.*?([\d\.]+p\d+)', full_raw, re.I)
         openssh = ssh_match.group(1) if ssh_match else "-"
 
@@ -201,8 +205,6 @@ with st.sidebar:
                         st.error(f"오류: {e}")
                 st.rerun()
 
-    # DB 초기화 메뉴
-    st.divider()
     with st.expander("💀 관리자 메뉴"):
         if st.button("💣 DB 초기화", type="primary"):
             cursor.execute("DROP TABLE IF EXISTS notes")
@@ -217,7 +219,7 @@ with st.sidebar:
                 st.rerun()
 
 # --- 5. 메인 렌더링 ---
-st.title("🛡️ TrusGuard 통합 관제 (v35.14)")
+st.title("🛡️ TrusGuard 통합 관제 (v35.15)")
 
 c1, c2 = st.columns([5,1], vertical_alignment="bottom")
 keyword = c1.text_input("검색어 입력", key=st.session_state.s_key)
