@@ -6,7 +6,7 @@ import re
 import os
 
 # --- 1. 페이지 스타일 및 문단 디자인 ---
-st.set_page_config(page_title="보안팀 릴리즈 아카이브 Pro v34.0", layout="wide")
+st.set_page_config(page_title="보안팀 릴리즈 아카이브 Pro v35.0", layout="wide")
 st.markdown("""
     <style>
     .version-title { font-size: 28px; font-weight: 800; color: #0D47A1; background-color: #E3F2FD; padding: 12px 20px; border-radius: 8px; margin-top: 5px; border-left: 10px solid #1565C0; }
@@ -24,47 +24,49 @@ cursor = conn.cursor()
 cursor.execute('''CREATE TABLE IF NOT EXISTS notes (id INTEGER PRIMARY KEY AUTOINCREMENT, version TEXT, openssl TEXT, openssh TEXT, improvements TEXT, issues TEXT, raw_text TEXT)''')
 conn.commit()
 
-# --- 3. [통합 엔진] 3.1.3(표) & 3.1.4(텍스트) 하이브리드 파싱 ---
+# --- 3. [통합 엔진] 표 데이터 문장화 및 텍스트 하이브리드 파싱 ---
 
-def parse_hybrid_v34(file):
+def parse_pdf_v35(file):
     with pdfplumber.open(file) as pdf:
         full_raw = ""
         combined_list = []
-        current_sec = None
-
+        
         for page in pdf.pages:
             p_text = page.extract_text() or ""
             full_raw += p_text + "\n"
             
-            # 섹션 감지 (3.1.4 버전 호환)
-            if "개선사항" in p_text or "Improvement" in p_text: current_sec = "IMP"
-            elif "이슈" in p_text or "Issue" in p_text: current_sec = "ISS"
-
-            # [A] 표(Table) 추출 로직 (3.1.3 이하 버전용)
+            # [A] 표(Table) 데이터 정밀 추출 (3.1.3 이하 버전 핵심)
             tables = page.extract_tables()
             for table in tables:
+                if not table: continue
                 for row in table:
+                    # 셀 내부 줄바꿈 제거 및 데이터 병합
                     cells = [str(c).replace('\n', ' ').strip() if c else "" for c in row]
-                    # 표의 1줄을 [유형] 내용 (ID) 한 문장으로 만들기
-                    if len(cells) >= 3 and any(kw in cells[0] for kw in ['개선', '신규', '이슈', '수정', 'BUG']):
-                        type_tag = cells[0]  # 개선/신규/이슈
-                        mod_func = cells[1]  # 기능 분류
-                        desc = cells[2]      # 상세 내용
-                        works_id = cells[3] if len(cells) > 3 else ""
+                    
+                    # 유형(개선/신규/이슈)이 포함된 행을 찾아 한 문장으로 조립
+                    if len(cells) >= 3 and any(kw in cells[0] for kw in ['개선', '신규', '이슈', '수정', 'BUG', 'TASK']):
+                        v_type = cells[0]   # 개선/신규/이슈
+                        v_cat = cells[1]    # 기능 분류
+                        v_desc = cells[2]   # 요약 내용
+                        v_id = cells[3] if len(cells) > 3 else "" # WORKS ID
                         
-                        line = f"• [{type_tag}/{mod_func}] {desc}"
-                        if works_id and works_id.lower() != "none": line += f" ({works_id})"
-                        combined_list.append(line)
+                        # 사용자 요청 포맷: [유형/기능분류] 요약 (ID)
+                        assembled_line = f"• [{v_type}/{v_cat}] {v_desc}"
+                        if v_id and v_id.lower() != "none" and v_id != v_cat:
+                            assembled_line += f" ({v_id})"
+                        
+                        combined_list.append(assembled_line)
 
-            # [B] 일반 텍스트 추출 로직 (3.1.4 버전 및 불렛 기호 대응)
+            # [B] 일반 텍스트 및 불렛 기호 추출 (3.1.4 버전 호환)
             lines = p_text.split('\n')
             for l in lines:
                 clean_l = l.strip()
+                # • 로 시작하거나 [내용] 으로 시작하는 행 수집
                 if clean_l.startswith('•') or (clean_l.startswith('[') and ']' in clean_l):
-                    if len(clean_l) > 10: # 의미 있는 길이만
+                    if len(clean_l) > 10 and not any(clean_l in item for item in combined_list):
                         combined_list.append(clean_l)
 
-        # 정보 정리
+        # 버전 및 보안 정보
         v = re.search(r'TrusGuard\s+v?([\d\.]+)', full_raw, re.I)
         version = v.group(1) if v else "Unknown"
         ssl = re.search(r'OpenSSL\s+([\d\.]+[\w]*)', full_raw, re.I)
@@ -79,7 +81,7 @@ def parse_hybrid_v34(file):
     }
 
 # --- 4. 사이드바 메뉴 ---
-if 's_key' not in st.session_state: st.session_state.s_key = "v34"
+if 's_key' not in st.session_state: st.session_state.s_key = "v35"
 
 with st.sidebar:
     st.header("📜 버전 히스토리")
@@ -87,29 +89,32 @@ with st.sidebar:
     sel_v = st.radio("버전 선택", hist_df['version'].tolist()) if not hist_df.empty else None
 
     st.divider()
-    with st.expander("➕ PDF 신규 등록 (3.1.3 & 3.1.4 통합)", expanded=True):
+    with st.expander("➕ PDF 등록 (표 문장화 지원)", expanded=True):
         uploaded = st.file_uploader("파일 선택", accept_multiple_files=True, label_visibility="collapsed")
         if st.button("✅ DB 반영", use_container_width=True):
             for f in uploaded:
-                info = parse_hybrid_v34(f)
+                info = parse_pdf_v35(f)
                 cursor.execute("SELECT version FROM notes WHERE version = ?", (info['version'],))
                 if not cursor.fetchone():
                     cursor.execute("INSERT INTO notes (version, openssl, openssh, improvements, issues, raw_text) VALUES (?,?,?,?,?,?)",
                                    (info['version'], info['openssl'], info['openssh'], info['content'], "", info['raw']))
                     conn.commit()
-            st.success("데이터가 통합 반영되었습니다.")
             st.rerun()
 
     with st.expander("🗑️ 데이터 삭제"):
         if not hist_df.empty:
-            del_v = st.selectbox("삭제 버전", hist_df['version'].tolist())
-            if st.button("🚨 삭제 실행", use_container_width=True):
+            del_v = st.selectbox("삭제 버전 선택", hist_df['version'].tolist())
+            if st.button("🚨 삭제 실행"):
                 cursor.execute("DELETE FROM notes WHERE version = ?", (del_v,))
                 conn.commit()
                 st.rerun()
 
+    with st.expander("💾 시스템 DB 관리"):
+        if os.path.exists(DB_FILE):
+            with open(DB_FILE, "rb") as f: st.download_button("📥 DB 다운로드", f, file_name="notes.db")
+
 # --- 5. 메인 화면 ---
-st.title("🛡️ TrusGuard 통합 관제 (v34.0)")
+st.title("🛡️ TrusGuard 통합 관제 (v35.0)")
 
 c1, c2 = st.columns([5,1], vertical_alignment="bottom")
 keyword = c1.text_input("검색어 입력", key=st.session_state.s_key)
