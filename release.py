@@ -6,7 +6,7 @@ import re
 import os
 
 # --- 1. 페이지 스타일 및 레이아웃 ---
-st.set_page_config(page_title="보안팀 릴리즈 아카이브 Pro", layout="wide")
+st.set_page_config(page_title="보안팀 릴리즈 아카이브 Pro v21.0", layout="wide")
 
 st.markdown("""
     <style>
@@ -37,84 +37,121 @@ cursor.execute('''CREATE TABLE IF NOT EXISTS notes
                    improvements TEXT, issues TEXT, raw_text TEXT)''')
 conn.commit()
 
-# --- 3. [개선] 정교한 파싱 및 정제 로직 ---
+# --- 3. [개선] 텍스트 및 표 파싱 로직 ---
+
 def clean_report_text(raw_text):
     if not raw_text: return ""
-    # 1. 텍스트 내 줄바꿈과 불필요한 공백을 하나로 합침 (문장 잘림 방지)
+    # 1. 텍스트 내 줄바꿈과 불필요한 공백을 하나로 합침
     text = re.sub(r'\s+', ' ', raw_text).strip()
-    
-    # 2. 대괄호 [] 또는 글머리 기호를 기준으로 문단 나누기
-    # 안랩 문서의 특성인 [카테고리] 형식을 보존하며 나눔
+    # 2. 대괄호 [] 또는 특정 기호를 기준으로 분리
     parts = re.split(r'(\[|•|－|- )', text)
-    
     formatted_lines = []
     current_chunk = ""
-    
     for part in parts:
         if part in ['[', '•', '－', '- ']:
             if current_chunk.strip():
-                formatted_lines.append(f"• {current_chunk.strip()}")
+                formatted_lines.append(f"* {current_chunk.strip()}")
             current_chunk = part
         else:
             current_chunk += part
-            
     if current_chunk.strip():
-        formatted_lines.append(f"• {current_chunk.strip()}")
-        
+        formatted_lines.append(f"* {current_chunk.strip()}")
     return "\n".join(formatted_lines)
 
-def parse_pdf_expert(file):
-    """표(Table)와 일반 텍스트를 결합하여 짤림 없이 추출"""
+def process_custom_tables(page):
+    """
+    3.1.3.11 버전 등 상세변경사항 표를 감지하여 한 줄 포맷으로 변환
+    포맷: * [모듈/기능] 상세 내용 (이슈번호)
+    """
+    extracted_lines = []
+    tables = page.extract_tables()
+    for table in tables:
+        if not table or len(table) < 1: continue
+        
+        # 헤더 확인 (개선/신규/이슈 등)
+        header = [str(c).replace('\n', '') for c in table[0] if c]
+        
+        # 상세변경사항 표 특징: '구분', '모듈/기능', '상세 내용' 등의 컬럼 존재
+        if any('상세' in h or '내용' in h for h in header):
+            for row in table[1:]:
+                # 빈 셀 제거 및 텍스트 정제
+                cells = [str(c).strip().replace('\n', ' ') for c in row if c is not None]
+                if len(cells) >= 3:
+                    # 보통 0:구분, 1:모듈, 2:내용, 3:이슈번호
+                    cat = cells[1] # 모듈/기능
+                    desc = cells[2] # 상세 내용
+                    issue_no = cells[3] if len(cells) > 3 else ""
+                    
+                    line = f"* [{cat}] {desc}"
+                    if issue_no and issue_no != cat:
+                        line += f" ({issue_no})"
+                    extracted_lines.append(line)
+    return extracted_lines
+
+def parse_pdf_v21(file):
     with pdfplumber.open(file) as pdf:
-        full_content = ""
+        full_text_for_raw = ""
+        improvement_list = []
+        issue_list = []
+        
+        # 1. 전체 텍스트 추출 (버전 및 보안 정보용)
         for page in pdf.pages:
-            # 표 데이터 추출 및 결합
-            tables = page.extract_tables()
-            if tables:
-                for table in tables:
-                    for row in table:
-                        row_text = " ".join([str(cell).replace('\n', ' ') for cell in row if cell])
-                        full_content += row_text + " "
-            # 일반 텍스트 추출 (표와 겹칠 수 있으나 키워드 매칭을 위해 병합)
-            full_content += (page.extract_text() or "") + "\n"
-
-    # 버전 추출
-    v_match = re.search(r'TrusGuard\s+v?([\d\.]+)', full_content, re.I)
-    version = v_match.group(1) if v_match else "Unknown"
-    
-    # 섹션 추출 (패턴 다양화)
-    def get_section(start_patterns, end_patterns):
-        start_idx = -1
-        for p in start_patterns:
-            m = re.search(p, full_content, re.I | re.S)
-            if m: start_idx = m.end(); break
+            full_text_for_raw += (page.extract_text() or "") + "\n"
         
-        if start_idx == -1: return ""
+        # 2. 섹션별 정밀 파싱
+        # 상세변경사항(개선/신규) 및 상세변경사항(이슈) 텍스트를 찾기 위한 플래그
+        current_section = None
         
-        end_idx = len(full_content)
-        for p in end_patterns:
-            m = re.search(p, full_content[start_idx:], re.I | re.S)
-            if m: end_idx = start_idx + m.start(); break
+        for page in pdf.pages:
+            p_text = page.extract_text() or ""
             
-        return full_content[start_idx:end_idx].strip()
+            # 페이지 내 테이블 먼저 처리
+            table_lines = process_custom_tables(page)
+            
+            # 섹션 전환 감지
+            if re.search(r'상세변경사항\s*\(개선/신규\)', p_text):
+                current_section = "IMP"
+            elif re.search(r'상세변경사항\s*\(이슈\)', p_text):
+                current_section = "ISS"
+            elif re.search(r'5\.\s*연관제품|참고\s*사항', p_text):
+                current_section = None
+                
+            if table_lines:
+                if current_section == "IMP":
+                    improvement_list.extend(table_lines)
+                elif current_section == "ISS":
+                    issue_list.extend(table_lines)
+            else:
+                # 테이블이 없는 경우 일반 텍스트에서 섹션 추출 (기존 3.1.4 등 호환용)
+                pass
 
-    imp = get_section([r'주요\s*개선\s*사항', r'Improvement'], [r'주요\s*이슈\s*해결', r'Issue'])
-    iss = get_section([r'주요\s*이슈\s*해결', r'Issue'], [r'연관\s*제품', r'참고\s*사항', r'5\.'])
-    
-    ssl = re.search(r'OpenSSL\s+([\d\.]+[\w]*)', full_content, re.I)
-    ssh = re.search(r'OpenSSH\s+([\d\.]+p\d+)', full_content, re.I)
+        # 기존 3.1.4 호환용 섹션 추출 (테이블 결과가 없을 때)
+        if not improvement_list or not issue_list:
+            imp_raw = re.search(r'(주요\s*개선\s*사항|Improvement|상세변경사항\s*\(개선/신규\))(.*?)(주요\s*이슈\s*해결|Issue|상세변경사항\s*\(이슈\)|5\.)', full_text_for_raw, re.I | re.S)
+            iss_raw = re.search(r'(주요\s*이슈\s*해결|Issue|상세변경사항\s*\(이슈\))(.*?)(연관\s*제품|참고사항|5\.)', full_text_for_raw, re.I | re.S)
+            
+            if not improvement_list and imp_raw:
+                improvement_list = [clean_report_text(imp_raw.group(2))]
+            if not issue_list and iss_raw:
+                issue_list = [clean_report_text(iss_raw.group(2))]
+
+        # 버전 및 보안 정보
+        v_match = re.search(r'TrusGuard\s+v?([\d\.]+)', full_text_for_raw, re.I)
+        version = v_match.group(1) if v_match else "Unknown"
+        ssl = re.search(r'OpenSSL\s+([\d\.]+[\w]*)', full_text_for_raw, re.I)
+        ssh = re.search(r'OpenSSH\s+([\d\.]+p\d+)', full_text_for_raw, re.I)
 
     return {
         "version": version,
         "openssl": ssl.group(1) if ssl else "-",
         "openssh": ssh.group(1) if ssh else "-",
-        "improvements": clean_report_text(imp),
-        "issues": clean_report_text(iss),
-        "raw_text": full_content
+        "improvements": "\n".join(improvement_list).strip(),
+        "issues": "\n".join(issue_list).strip(),
+        "raw_text": full_text_for_raw
     }
 
-# --- 4. 사이드바 (기능 복구) ---
-if 'search_key' not in st.session_state: st.session_state.search_key = "v20"
+# --- 4. 사이드바 (모든 메뉴 복구) ---
+if 'search_key' not in st.session_state: st.session_state.search_key = "v21"
 
 def trigger_reset():
     st.session_state.search_key = os.urandom(4).hex()
@@ -126,19 +163,19 @@ with st.sidebar:
     
     selected_version = None
     if not history_df.empty:
-        selected_version = st.radio("버전을 선택하면 상세 내용이 표시됩니다:", history_df['version'].tolist())
+        selected_version = st.radio("상세 내용을 볼 버전을 선택하세요:", history_df['version'].tolist())
     else:
         st.write("등록된 데이터가 없습니다.")
 
     st.markdown("<br><br>", unsafe_allow_html=True)
     st.divider()
 
-    # 메뉴들을 Expander로 깔끔하게 정리
-    with st.expander("➕ PDF 신규 등록", expanded=False):
+    # [중요] DB 관리 메뉴들
+    with st.expander("➕ PDF 신규 등록 (3.1.3.11 지원)", expanded=False):
         files = st.file_uploader("PDF 선택", accept_multiple_files=True, label_visibility="collapsed")
         if st.button("✅ DB 반영", use_container_width=True):
             for f in files:
-                info = parse_pdf_expert(f)
+                info = parse_pdf_v21(f)
                 cursor.execute("SELECT version FROM notes WHERE version = ?", (info['version'],))
                 if cursor.fetchone():
                     st.warning(f"⚠️ {info['version']} 이미 존재합니다.")
@@ -146,7 +183,7 @@ with st.sidebar:
                 cursor.execute("INSERT INTO notes (version, openssl, openssh, improvements, issues, raw_text) VALUES (?,?,?,?,?,?)",
                                (info['version'], info['openssl'], info['openssh'], info['improvements'], info['issues'], info['raw_text']))
                 conn.commit()
-            st.success("데이터가 성공적으로 반영되었습니다.")
+            st.success("데이터 반영 성공!")
             st.rerun()
 
     with st.expander("🗑️ 데이터 삭제", expanded=False):
@@ -157,10 +194,10 @@ with st.sidebar:
                 conn.commit()
                 st.rerun()
 
-    with st.expander("💾 시스템 DB 관리", expanded=False):
+    with st.expander("💾 시스템 DB 관리 (백업/업로드)", expanded=False):
         if os.path.exists(DB_FILE):
             with open(DB_FILE, "rb") as f:
-                st.download_button("📥 현재 DB 다운로드", f, file_name="security_notes_backup.db", mime="application/octet-stream")
+                st.download_button("📥 현재 DB 다운로드", f, file_name="security_notes.db", mime="application/octet-stream")
         
         uploaded_db = st.file_uploader("📤 백업 DB 업로드", type=['db'], label_visibility="collapsed")
         if uploaded_db and st.button("🔥 서버 DB 교체"):
@@ -170,16 +207,15 @@ with st.sidebar:
             st.rerun()
 
 # --- 5. 메인 화면 ---
-st.title("🛡️ TrusGuard 통합 릴리즈 관제센터")
+st.title("🛡️ TrusGuard 통합 릴리즈 관제 (v21.0)")
 
-# 검색바 정렬 수정
 col_search, col_btn = st.columns([5, 1], vertical_alignment="bottom")
 with col_search:
-    keyword = st.text_input("검색어 입력 (공백으로 여러 단어 검색)", key=st.session_state.search_key)
+    keyword = st.text_input("검색어 입력", placeholder="예: VPN 접속", key=st.session_state.search_key)
 with col_btn:
     st.button("🔄 초기화", use_container_width=True, on_click=trigger_reset)
 
-# 텍스트 강조 및 출력
+# 강조 및 출력 함수
 def highlight(text, kws):
     if not kws: return text.replace("\n", "<br>")
     for k in kws:
@@ -192,22 +228,23 @@ if keyword:
     search_res = pd.read_sql_query(query, conn, params=[f'%{k}%' for k in kws])
 
     if not search_res.empty:
-        st.subheader(f"🔎 '{keyword}' 통합 검색 결과 ({len(search_res)}건)")
+        st.subheader(f"🔎 '{keyword}' 검색 결과 ({len(search_res)}건)")
         for _, row in search_res.iterrows():
             st.markdown(f"<div class='version-title'>📦 TrusGuard {row['version']}</div>", unsafe_allow_html=True)
+            # 개선/이슈 텍스트 합치기
             all_content = (row['improvements'] + "\n" + row['issues']).split('\n')
             matched = [l for l in all_content if all(k.lower() in l.lower() for k in kws) and l.strip()]
-            st.markdown(f"<div class='report-card'>{highlight('\n'.join(matched) if matched else '*(본문 내 키워드 존재)*', kws)}</div>", unsafe_allow_html=True)
+            st.markdown(f"<div class='report-card'>{highlight('\n'.join(matched) if matched else '*(본문 내 존재)*', kws)}</div>", unsafe_allow_html=True)
     else:
-        st.error("검색 결과가 없습니다.")
+        st.error("결과가 없습니다.")
 
 elif selected_version:
     res = pd.read_sql_query("SELECT * FROM notes WHERE version = ?", conn, params=[selected_version]).iloc[0]
-    st.markdown(f"<div class='version-title'>📋 TrusGuard {res['version']} 전체 리포트</div>", unsafe_allow_html=True)
+    st.markdown(f"<div class='version-title'>📋 TrusGuard {res['version']} 상세 리포트</div>", unsafe_allow_html=True)
     st.markdown(f"""
     <div class='report-card'>
         <span class='sub-label'>🔒 보안 컴포넌트</span> OpenSSL: {res['openssl']} / OpenSSH: {res['openssh']}<br><br>
-        <span class='sub-label'>🔼 주요 개선 사항</span> {res['improvements'].replace('\n', '<br>')}<br><br>
-        <span class='sub-label'>🔥 주요 이슈 해결</span> {res['issues'].replace('\n', '<br>')}
+        <span class='sub-label'>🔼 상세변경사항 (개선/신규)</span> {res['improvements'].replace('\n', '<br>')}<br><br>
+        <span class='sub-label'>🔥 상세변경사항 (이슈)</span> {res['issues'].replace('\n', '<br>')}
     </div>
     """, unsafe_allow_html=True)
