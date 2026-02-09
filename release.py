@@ -5,20 +5,12 @@ import pandas as pd
 import re
 import os
 
-# --- 1. 페이지 스타일 설정 ---
+# --- 1. 페이지 스타일 ---
 st.set_page_config(page_title="보안팀 릴리즈 아카이브 Pro", layout="wide")
-
 st.markdown("""
     <style>
-    .version-title { 
-        font-size: 28px !important; font-weight: 800 !important; color: #0D47A1 !important; 
-        background-color: #E3F2FD; padding: 12px 20px; border-radius: 8px; 
-        margin-top: 5px; border-left: 10px solid #1565C0;
-    }
-    .report-card { 
-        padding: 25px; border: 1px solid #CFD8DC; background-color: white;
-        border-radius: 0px 0px 8px 8px; margin-bottom: 30px; line-height: 1.8;
-    }
+    .version-title { font-size: 28px !important; font-weight: 800; color: #0D47A1; background-color: #E3F2FD; padding: 12px 20px; border-radius: 8px; margin-top: 5px; border-left: 10px solid #1565C0; }
+    .report-card { padding: 25px; border: 1px solid #CFD8DC; background-color: white; border-radius: 0px 0px 8px 8px; margin-bottom: 30px; line-height: 1.8; }
     .sub-label { font-weight: bold; color: #455A64; margin-top: 10px; display: block; }
     .highlight { background-color: #FFFF00; color: black; font-weight: bold; }
     </style>
@@ -26,164 +18,118 @@ st.markdown("""
 
 # --- 2. DB 연결 ---
 DB_FILE = 'security_notes_archive.db'
-def get_connection():
-    return sqlite3.connect(DB_FILE, check_same_thread=False)
-
-conn = get_connection()
+conn = sqlite3.connect(DB_FILE, check_same_thread=False)
 cursor = conn.cursor()
-cursor.execute('''CREATE TABLE IF NOT EXISTS notes 
-                  (id INTEGER PRIMARY KEY AUTOINCREMENT, 
-                   version TEXT, openssl TEXT, openssh TEXT, 
-                   improvements TEXT, issues TEXT, raw_text TEXT)''')
+cursor.execute('''CREATE TABLE IF NOT EXISTS notes (id INTEGER PRIMARY KEY AUTOINCREMENT, version TEXT, openssl TEXT, openssh TEXT, improvements TEXT, issues TEXT, raw_text TEXT)''')
 conn.commit()
 
-# --- 3. [강화된 파싱 로직] ---
-def clean_format(section_text):
-    if not section_text: return ""
-    # 불필요한 따옴표, 중복 줄바꿈 제거
-    text = section_text.replace('"', '').replace("'", "")
-    text = re.sub(r'\s+', ' ', text).strip()
+# --- 3. [개선된 파싱 함수] ---
+def clean_report_text(raw_text):
+    if not raw_text: return ""
+    # 불필요한 따옴표 및 줄바꿈 정제
+    clean = raw_text.replace('"', '').replace("'", "").strip()
+    clean = re.sub(r'\n+', ' ', clean) # 줄바꿈을 일단 공백으로 통합
     
-    # 대괄호([]) 또는 특정 기호(•, -) 기준으로 문단 나누기
-    parts = re.split(r'(\[|•|- )', text)
+    # 주요 구분 기호를 기준으로 문단 나누기
+    # [항목], •, -, 번호(1., 2.) 등 대응
+    parts = re.split(r'(\[|•|- |\d+\.)', clean)
     
-    formatted_lines = []
-    current_line = ""
-    
-    for part in parts:
-        if part in ['[', '•', '- ']:
-            if current_line.strip():
-                formatted_lines.append(f"* {current_line.strip()}")
-            current_line = part
+    lines = []
+    current = ""
+    for p in parts:
+        if p in ['[', '•', '- '] or re.match(r'\d+\.', p):
+            if current.strip(): lines.append(f"* {current.strip()}")
+            current = p
         else:
-            current_line += part
-            
-    if current_line.strip():
-        formatted_lines.append(f"* {current_line.strip()}")
-        
-    return "\n".join(formatted_lines)
+            current += p
+    if current.strip(): lines.append(f"* {current.strip()}")
+    return "\n".join(lines)
 
-def extract_release_info(text):
-    """다양한 형식의 릴리즈 노트에서 핵심 정보 추출"""
-    # 1. 버전 추출 (TrusGuard 뒤에 오는 숫자 조합들)
-    v_match = re.search(r'TrusGuard\s+v?([\d\.]+)', text, re.IGNORECASE)
+def parse_enhanced_pdf(file):
+    with pdfplumber.open(file) as pdf:
+        full_text = ""
+        for page in pdf.pages:
+            # 1. 표(Table) 추출 시도
+            tables = page.extract_tables()
+            if tables:
+                for table in tables:
+                    for row in table:
+                        # None 값 제거 및 텍스트 합치기
+                        row_text = " ".join([cell for cell in row if cell])
+                        full_text += row_text + "\n"
+            # 2. 일반 텍스트 추출 병행
+            full_text += (page.extract_text() or "") + "\n"
+
+    # 버전 추출 (v3.0.0.14 등 대응)
+    v_match = re.search(r'TrusGuard\s+v?([\d\.]+)', full_text, re.I)
     version = v_match.group(1) if v_match else "Unknown"
 
-    # 2. 보안 컴포넌트 (OpenSSL, OpenSSH)
-    openssl = re.search(r'OpenSSL\s+([\d\.]+[\w]*)', text, re.IGNORECASE)
-    openssh = re.search(r'OpenSSH\s+([\d\.]+p\d+)', text, re.IGNORECASE)
+    # 섹션별 텍스트 범위 탐색 (더 넓은 범위의 키워드 적용)
+    # 3.0.0.14 파일은 '주요 개선 사항'과 '주요 이슈 해결' 키워드 사용
+    imp_start = re.search(r'(주요\s*개선\s*사항|Improvement)', full_text, re.I)
+    iss_start = re.search(r'(주요\s*이슈\s*해결|Issue)', full_text, re.I)
+    ref_start = re.search(r'(연관\s*제품|참고\s*사항|5\.)', full_text, re.I)
 
-    # 3. 주요 내용 섹션 (표 형식이나 리스트 형식을 모두 포괄하도록 패턴 확장)
-    # 개선사항(Improvement) 섹션 탐색
-    imp_patterns = [r'주요\s*개선\s*사항(.*?)(이슈|제약|참고|$)', r'Improvement(.*?)(Issue|$|5\.)']
-    improvements = ""
-    for p in imp_patterns:
-        match = re.search(p, text, re.DOTALL | re.IGNORECASE)
-        if match:
-            improvements = match.group(1)
-            break
-
-    # 이슈(Issue) 섹션 탐색
-    iss_patterns = [r'주요\s*이슈\s*해결(.*?)(연관|참고|$)', r'Issue(.*?)(5\.|참고|$)', r'주요\s*수정\s*내용(.*?)연관']
-    issues = ""
-    for p in iss_patterns:
-        match = re.search(p, text, re.DOTALL | re.IGNORECASE)
-        if match:
-            issues = match.group(1)
-            break
+    imp_text = full_text[imp_start.end():iss_start.start()] if imp_start and iss_start else ""
+    iss_text = full_text[iss_start.end():ref_start.start()] if iss_start and ref_start else ""
+    
+    # 보안 컴포넌트
+    ssl = re.search(r'OpenSSL\s+([\d\.]+[\w]*)', full_text, re.I)
+    ssh = re.search(r'OpenSSH\s+([\d\.]+p\d+)', full_text, re.I)
 
     return {
         "version": version,
-        "openssl": openssl.group(1) if openssl else "-",
-        "openssh": openssh.group(1) if openssh else "-",
-        "improvements": clean_format(improvements),
-        "issues": clean_format(issues),
-        "raw_text": text
+        "openssl": ssl.group(1) if ssl else "-",
+        "openssh": ssh.group(1) if ssh else "-",
+        "improvements": clean_report_text(imp_text),
+        "issues": clean_report_text(iss_text),
+        "raw_text": full_text
     }
 
-# --- 4. 사이드바 (데이터 관리) ---
+# --- 4. 메인 UI ---
 with st.sidebar:
     st.header("📜 버전 히스토리")
-    history_df = pd.read_sql_query("SELECT version FROM notes ORDER BY version DESC", conn)
+    history = pd.read_sql_query("SELECT version FROM notes ORDER BY version DESC", conn)
+    selected_v = st.radio("버전 선택", history['version'].tolist()) if not history.empty else None
     
-    selected_version = st.radio("상세 보기 선택:", history_df['version'].tolist()) if not history_df.empty else None
-
-    st.markdown("<br><br>", unsafe_allow_html=True)
     st.divider()
-    
-    with st.expander("➕ PDF 신규 등록", expanded=False):
+    with st.expander("➕ PDF 등록 (표 형식 대응)"):
         files = st.file_uploader("파일 선택", accept_multiple_files=True, label_visibility="collapsed")
         if st.button("✅ DB 반영", use_container_width=True):
-            if files:
-                for f in files:
-                    with pdfplumber.open(f) as pdf:
-                        full_text = ""
-                        for page in pdf.pages:
-                            # 표(Table) 데이터도 텍스트로 변환하여 포함
-                            table_text = page.extract_text() or ""
-                            full_text += table_text + "\n"
-                    
-                    info = extract_release_info(full_text)
-                    
-                    # 중복 체크
-                    cursor.execute("SELECT version FROM notes WHERE version = ?", (info['version'],))
-                    if cursor.fetchone():
-                        st.warning(f"⚠️ {info['version']} 이미 존재")
-                        continue
-
-                    cursor.execute("""INSERT INTO notes (version, openssl, openssh, improvements, issues, raw_text) 
-                                      VALUES (?, ?, ?, ?, ?, ?)""",
-                                   (info['version'], info['openssl'], info['openssh'], 
-                                    info['improvements'], info['issues'], info['raw_text']))
-                    conn.commit()
-                st.success("반영 완료!")
-                st.rerun()
-
-    with st.expander("🗑️ 데이터 삭제"):
-        if not history_df.empty:
-            del_v = st.selectbox("삭제 버전", history_df['version'].tolist())
-            if st.button("🚨 삭제 실행"):
-                cursor.execute("DELETE FROM notes WHERE version = ?", (del_v,))
+            for f in files:
+                info = parse_enhanced_pdf(f)
+                cursor.execute("SELECT version FROM notes WHERE version = ?", (info['version'],))
+                if cursor.fetchone(): 
+                    st.warning(f"{info['version']} 중복")
+                    continue
+                cursor.execute("INSERT INTO notes (version, openssl, openssh, improvements, issues, raw_text) VALUES (?,?,?,?,?,?)",
+                               (info['version'], info['openssl'], info['openssh'], info['improvements'], info['issues'], info['raw_text']))
                 conn.commit()
-                st.rerun()
+            st.rerun()
 
-# --- 5. 메인 화면 ---
-st.title("🛡️ TrusGuard 통합 릴리즈 관제센터")
+st.title("🛡️ TrusGuard 통합 관제 (v19.1)")
 
-# 검색 및 초기화
-if 'search_key' not in st.session_state: st.session_state.search_key = "v19"
-col1, col2 = st.columns([5, 1], vertical_alignment="bottom")
-with col1:
-    keyword = st.text_input("검색어", key=st.session_state.search_key)
-with col2:
-    if st.button("🔄 초기화"):
-        st.session_state.search_key = os.urandom(5).hex()
-        st.rerun()
+# 검색 로직
+if 's_key' not in st.session_state: st.session_state.s_key = "v191"
+c1, c2 = st.columns([5,1], vertical_alignment="bottom")
+keyword = c1.text_input("검색어 입력", key=st.session_state.s_key)
+if c2.button("🔄 초기화"):
+    st.session_state.s_key = os.urandom(4).hex()
+    st.rerun()
 
-def highlight_text(text, kws):
-    if not kws: return text.replace("\n", "<br>")
-    for k in kws:
-        text = re.sub(f"({re.escape(k)})", r"<mark class='highlight'>\1</mark>", text, flags=re.IGNORECASE)
-    return text.replace("\n", "<br>")
-
-# 결과 출력
 if keyword:
     kws = keyword.split()
-    query = "SELECT version, improvements, issues FROM notes WHERE "
-    query += " AND ".join(["raw_text LIKE ?" for _ in kws]) + " ORDER BY version DESC"
-    search_df = pd.read_sql_query(query, conn, params=[f'%{k}%' for k in kws])
-
-    for _, row in search_df.iterrows():
+    q = "SELECT version, improvements, issues FROM notes WHERE " + " AND ".join(["raw_text LIKE ?" for _ in kws]) + " ORDER BY version DESC"
+    res = pd.read_sql_query(q, conn, params=[f'%{k}%' for k in kws])
+    for _, row in res.iterrows():
         st.markdown(f"<div class='version-title'>📦 TrusGuard {row['version']}</div>", unsafe_allow_html=True)
-        all_lines = (row['improvements'] + "\n" + row['issues']).split('\n')
-        matched_lines = [l for l in all_lines if all(k.lower() in l.lower() for k in kws) and l.strip()]
-        st.markdown(f"<div class='report-card'>{highlight_text('\n'.join(matched_lines) if matched_lines else '*(본문 존재)*', kws)}</div>", unsafe_allow_html=True)
+        content = (row['improvements'] + "\n" + row['issues']).split('\n')
+        matched = [l for l in content if all(k.lower() in l.lower() for k in kws) and l.strip()]
+        display = "\n".join(matched) if matched else "*(본문 존재)*"
+        for k in kws: display = re.sub(f"({re.escape(k)})", r"<mark class='highlight'>\1</mark>", display, flags=re.I)
+        st.markdown(f"<div class='report-card'>{display.replace('\n','<br>')}</div>", unsafe_allow_html=True)
 
-elif selected_version:
-    res = pd.read_sql_query("SELECT * FROM notes WHERE version = ?", conn, params=[selected_version]).iloc[0]
-    st.markdown(f"<div class='version-title'>📋 TrusGuard {res['version']} 리포트</div>", unsafe_allow_html=True)
-    st.markdown(f"""<div class='report-card'>
-        <span class='sub-label'>🔒 보안 컴포넌트</span> OpenSSL: {res['openssl']} / OpenSSH: {res['openssh']}<br><br>
-        <span class='sub-label'>🔼 개선 사항</span> {res['improvements'].replace('\n', '<br>')}<br><br>
-        <span class='sub-label'>🔥 이슈 해결</span> {res['issues'].replace('\n', '<br>')}
-    </div>""", unsafe_allow_html=True)
+elif selected_v:
+    r = pd.read_sql_query("SELECT * FROM notes WHERE version = ?", conn, params=[selected_v]).iloc[0]
+    st.markdown(f"<div class='version-title'>📋 TrusGuard {r['version']} 상세</div>", unsafe_allow_html=True)
+    st.markdown(f"<div class='report-card'><span class='sub-label'>🔒 보안 컴포넌트</span>OpenSSL: {r['openssl']} / OpenSSH: {r['openssh']}<br><br><span class='sub-label'>🔼 개선 사항</span>{r['improvements'].replace('\n','<br>')}<br><br><span class='sub-label'>🔥 이슈 해결</span>{r['issues'].replace('\n','<br>')}</div>", unsafe_allow_html=True)
