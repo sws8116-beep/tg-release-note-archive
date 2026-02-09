@@ -5,15 +5,15 @@ import pandas as pd
 import re
 import os
 
-# --- 1. 페이지 스타일 설정 ---
-st.set_page_config(page_title="보안팀 릴리즈 아카이브 Pro", layout="wide")
+# --- 1. 페이지 스타일 및 레이아웃 설정 ---
+st.set_page_config(page_title="AhnLab TG 릴리즈 아카이브", layout="wide")
 
 st.markdown("""
     <style>
     .version-title { 
         font-size: 28px !important; font-weight: 800 !important; color: #0D47A1 !important; 
         background-color: #E3F2FD; padding: 12px 20px; border-radius: 8px; 
-        margin-top: 10px; border-left: 10px solid #1565C0;
+        margin-top: 5px; border-left: 10px solid #1565C0;
     }
     .report-card { 
         padding: 25px; border: 1px solid #CFD8DC; background-color: white;
@@ -21,7 +21,6 @@ st.markdown("""
     }
     .sub-label { font-weight: bold; color: #455A64; margin-top: 10px; display: block; }
     .highlight { background-color: #FFFF00; color: black; font-weight: bold; }
-    /* 사이드바 폰트 조절 */
     .small-font { font-size: 12px !important; color: #757575; }
     </style>
     """, unsafe_allow_html=True)
@@ -52,23 +51,30 @@ def clean_format(section_text):
         formatted.append(f"• {bracket}{content.strip()}")
     return "\n".join(formatted)
 
-# --- 4. 사이드바 구성 (중요도 순서 변경) ---
+# --- 4. 검색어 리셋 함수 ---
+def reset_search():
+    st.session_state.search_input = ""
+    st.session_state.search_key = str(os.urandom(5)) # 입력창 강제 리셋용 키 변경
+
+if 'search_key' not in st.session_state:
+    st.session_state.search_key = "first_run"
+
+# --- 5. 사이드바 구성 ---
 with st.sidebar:
     st.header("📜 버전 히스토리")
-    # 전체 버전 목록을 가장 먼저 표시
     history_df = pd.read_sql_query("SELECT version FROM notes ORDER BY version DESC", conn)
     
     selected_version = None
     if not history_df.empty:
-        # 버전 선택을 라디오 버튼 형식으로 표시하여 클릭 시 즉시 반영되게 함
-        selected_version = st.radio("상세 내용을 볼 버전을 선택하세요:", history_df['version'].tolist())
+        # 라벨을 숨기고 라디오 버튼 배치
+        selected_version = st.radio("상세 내용을 볼 버전을 선택하세요:", history_df['version'].tolist(), key="sidebar_radio")
     else:
         st.write("등록된 데이터가 없습니다.")
 
-    st.markdown("<br><br><br>", unsafe_allow_html=True) # 간격 띄우기
+    st.markdown("<br><br>", unsafe_allow_html=True)
     st.divider()
     
-    # PDF 신규 등록 (작게 표시)
+    # 관리 기능 (Expander로 숨김)
     with st.expander("➕ PDF 신규 등록", expanded=False):
         files = st.file_uploader("파일 선택", accept_multiple_files=True, label_visibility="collapsed")
         if st.button("✅ DB 반영", use_container_width=True):
@@ -90,7 +96,6 @@ with st.sidebar:
                 st.success("반영 완료!")
                 st.rerun()
 
-    # DB 백업 및 복구 (가장 아래 작게)
     with st.expander("💾 시스템 관리", expanded=False):
         st.markdown("<p class='small-font'>DB 백업/복구</p>", unsafe_allow_html=True)
         if os.path.exists(DB_FILE):
@@ -104,16 +109,17 @@ with st.sidebar:
             st.success("교체 완료!")
             st.rerun()
 
-# --- 5. 메인 화면 ---
+# --- 6. 메인 화면 및 검색바 정렬 ---
 st.title("🛡️ TrusGuard 통합 릴리즈 관제센터")
 
-search_col1, search_col2 = st.columns([5, 1])
-with search_col1:
-    keyword = st.text_input("검색어 입력", placeholder="예: VPN 접속")
-with search_col2:
-    st.write(" ")
-    if st.button("🔄 검색 초기화", use_container_width=True):
-        st.rerun()
+# vertical_alignment 옵션을 사용하여 버튼과 검색창 높이를 맞춤
+col1, col2 = st.columns([5, 1], vertical_alignment="bottom")
+
+with col1:
+    keyword = st.text_input("검색어 입력", placeholder="예: VPN 접속", key=st.session_state.search_key)
+
+with col2:
+    st.button("🔄 초기화", use_container_width=True, on_click=reset_search)
 
 # 텍스트 강조 함수
 def highlight_text(text, kws):
@@ -122,7 +128,7 @@ def highlight_text(text, kws):
         text = re.sub(f"({re.escape(k)})", r"<mark class='highlight'>\1</mark>", text, flags=re.IGNORECASE)
     return text.replace("\n", "<br>")
 
-# --- 6. 출력 로직 (통합 검색 또는 개별 상세 보기) ---
+# --- 7. 통합 검색 결과 또는 개별 상세 내용 출력 ---
 if keyword:
     kws = keyword.split()
     query = "SELECT version, improvements, issues FROM notes WHERE "
@@ -141,7 +147,6 @@ if keyword:
         st.error("검색 결과가 없습니다.")
 
 elif selected_version:
-    # 검색어가 없을 때: 좌측 사이드바에서 선택된 버전의 전체 내용 표시
     res = pd.read_sql_query("SELECT * FROM notes WHERE version = ?", conn, params=[selected_version]).iloc[0]
     st.markdown(f"<div class='version-title'>📋 TrusGuard {res['version']} 전체 리포트</div>", unsafe_allow_html=True)
     
