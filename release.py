@@ -5,13 +5,13 @@ import pandas as pd
 import re
 import os
 
-# --- 1. 페이지 스타일 ---
-st.set_page_config(page_title="보안팀 릴리즈 아카이브 Pro v23.0", layout="wide")
+# --- 1. 페이지 스타일 및 정렬 ---
+st.set_page_config(page_title="보안팀 릴리즈 아카이브 Pro v24.0", layout="wide")
 st.markdown("""
     <style>
     .version-title { font-size: 28px; font-weight: 800; color: #0D47A1; background-color: #E3F2FD; padding: 12px 20px; border-radius: 8px; margin-top: 5px; border-left: 10px solid #1565C0; }
     .report-card { padding: 25px; border: 1px solid #CFD8DC; background-color: white; border-radius: 0px 0px 8px 8px; margin-bottom: 30px; line-height: 1.8; }
-    .sub-label { font-weight: bold; color: #455A64; margin-top: 10px; display: block; font-size: 16px; }
+    .sub-label { font-weight: bold; color: #455A64; margin-top: 15px; display: block; font-size: 16px; }
     .highlight { background-color: #FFFF00; color: black; font-weight: bold; }
     </style>
     """, unsafe_allow_html=True)
@@ -23,8 +23,8 @@ cursor = conn.cursor()
 cursor.execute('''CREATE TABLE IF NOT EXISTS notes (id INTEGER PRIMARY KEY AUTOINCREMENT, version TEXT, openssl TEXT, openssh TEXT, improvements TEXT, issues TEXT, raw_text TEXT)''')
 conn.commit()
 
-# --- 3. [핵심] 3.1.3.11 전용 표 파싱 엔진 ---
-def parse_pdf_v23(file):
+# --- 3. [핵심] 3.1.3.11 표 행 결합 파싱 엔진 ---
+def parse_pdf_v24(file):
     with pdfplumber.open(file) as pdf:
         full_raw = ""
         imp_list = []
@@ -35,31 +35,34 @@ def parse_pdf_v23(file):
             p_text = page.extract_text() or ""
             full_raw += p_text + "\n"
             
-            # 섹션 감지
-            if "상세변경사항 (개선/신규)" in p_text: current_sec = "IMP"
+            # 섹션 감지 (3.1.3.11 기준)
+            if "상세변경사항 (개세/신규)" in p_text or "상세변경사항 (개선/신규)" in p_text: current_sec = "IMP"
             elif "상세변경사항 (이슈)" in p_text: current_sec = "ISS"
             elif "5. 연관제품" in p_text or "참고사항" in p_text: current_sec = None
             
-            # 표 추출 및 행 데이터 병합 (짤림 방지 핵심)
+            # 표 추출 및 행 데이터 병합 (짤림 방지 핵심 로직)
             tables = page.extract_tables()
             for table in tables:
+                if not table: continue
                 for row in table:
-                    # 셀 내부에 줄바꿈(\n)이 있으면 공백으로 치환하여 문장을 하나로 합침
-                    cells = [str(c).replace('\n', ' ').strip() for c in row if c is not None]
+                    # 각 셀의 None 값을 빈 문자열로 바꾸고, 내부 줄바꿈(\n)을 공백으로 합침
+                    cells = [str(c).replace('\n', ' ').strip() if c else "" for c in row]
                     
-                    # 3.1.3.11 표 구조: [구분, 모듈, 상세 내용, 이슈번호]
+                    # 유효한 데이터 행인지 확인 (구분 칸에 '개선', '신규', '이슈'가 포함된 경우)
                     if len(cells) >= 3 and any(x in cells[0] for x in ['개선', '신규', '이슈']):
-                        mod = cells[1] # 모듈/기능
-                        desc = cells[2] # 상세 내용 (이제 안 짤림)
+                        mod = cells[1]   # 모듈/기능
+                        desc = cells[2]  # 상세 내용 (이제 줄바꿈 없이 하나로 합쳐짐)
                         issue = cells[3] if len(cells) > 3 else ""
                         
+                        # 출력 포맷: * [모듈] 상세내용 (이슈번호)
                         line = f"* [{mod}] {desc}"
-                        if issue and issue not in mod: line += f" ({issue})"
+                        if issue and issue != mod and issue != "None":
+                            line += f" ({issue})"
                         
                         if current_sec == "IMP": imp_list.append(line)
                         elif current_sec == "ISS": iss_list.append(line)
 
-        # 정보 정리
+        # 버전 및 보안 컴포넌트 추출
         v = re.search(r'TrusGuard\s+v?([\d\.]+)', full_raw, re.I)
         version = v.group(1) if v else "Unknown"
         ssl = re.search(r'OpenSSL\s+([\d\.]+[\w]*)', full_raw, re.I)
@@ -69,57 +72,60 @@ def parse_pdf_v23(file):
         "version": version,
         "openssl": ssl.group(1) if ssl else "-",
         "openssh": ssh.group(1) if ssh else "-",
-        "improvements": "\n".join(dict.fromkeys(imp_list)), # 중복 제거
+        "improvements": "\n".join(dict.fromkeys(imp_list)), # 중복 행 제거
         "issues": "\n".join(dict.fromkeys(iss_list)),
         "raw_text": full_raw
     }
 
-# --- 4. 사이드바 (DB 관리 메뉴 완전 복구) ---
-if 's_key' not in st.session_state: st.session_state.s_key = "v23"
+# --- 4. 사이드바 (모든 메뉴 완벽 복구) ---
+if 's_key' not in st.session_state: st.session_state.s_key = "v24"
 
 with st.sidebar:
     st.header("📜 전체 히스토리")
+    # 등록된 전체 버전 목록
     hist_df = pd.read_sql_query("SELECT version FROM notes ORDER BY version DESC", conn)
     sel_v = st.radio("상세 보기 선택", hist_df['version'].tolist()) if not hist_df.empty else None
 
     st.divider()
-    # PDF 등록 메뉴
+    # 1. PDF 신규 등록 메뉴
     with st.expander("➕ PDF 신규 등록", expanded=False):
         uploaded = st.file_uploader("파일 선택", accept_multiple_files=True, label_visibility="collapsed")
         if st.button("✅ DB 반영", use_container_width=True):
             for f in uploaded:
-                info = parse_pdf_v23(f)
+                info = parse_pdf_v24(f)
+                # 버전 중복 체크
                 cursor.execute("SELECT version FROM notes WHERE version = ?", (info['version'],))
                 if not cursor.fetchone():
                     cursor.execute("INSERT INTO notes (version, openssl, openssh, improvements, issues, raw_text) VALUES (?,?,?,?,?,?)",
                                    (info['version'], info['openssl'], info['openssh'], info['improvements'], info['issues'], info['raw_text']))
                     conn.commit()
-            st.success("반영 완료!")
+            st.success("데이터 반영 성공!")
             st.rerun()
 
-    # 데이터 삭제 메뉴
+    # 2. 잘못 들어간 데이터 삭제 메뉴
     with st.expander("🗑️ 데이터 삭제", expanded=False):
         if not hist_df.empty:
-            del_v = st.selectbox("삭제 버전", hist_df['version'].tolist())
+            del_v = st.selectbox("삭제 버전 선택", hist_df['version'].tolist())
             if st.button("🚨 삭제 실행", use_container_width=True):
                 cursor.execute("DELETE FROM notes WHERE version = ?", (del_v,))
                 conn.commit()
                 st.rerun()
 
-    # DB 파일 관리
+    # 3. DB 파일 관리 (백업/업로드)
     with st.expander("💾 시스템 DB 관리", expanded=False):
         if os.path.exists(DB_FILE):
-            with open(DB_FILE, "rb") as f: st.download_button("📥 DB 다운로드", f, file_name="security_notes.db")
-        up_db = st.file_uploader("📤 DB 업로드", type=['db'])
+            with open(DB_FILE, "rb") as f: st.download_button("📥 현재 DB 다운로드", f, file_name="notes_backup.db")
+        up_db = st.file_uploader("📤 백업 DB 업로드", type=['db'])
         if up_db and st.button("🔥 서버 DB 교체"):
             with open(DB_FILE, "wb") as f: f.write(up_db.getbuffer())
             st.rerun()
 
 # --- 5. 메인 화면 ---
-st.title("🛡️ TrusGuard 통합 관제 (v23.0)")
+st.title("🛡️ TrusGuard 통합 관제 (v24.0)")
 
+# 검색바와 초기화 버튼 수평 정렬
 c1, c2 = st.columns([5,1], vertical_alignment="bottom")
-keyword = c1.text_input("검색어 입력 (공백 시 AND 검색)", key=st.session_state.s_key)
+keyword = c1.text_input("검색어 입력 (공백 시 다중 검색)", key=st.session_state.s_key)
 if c2.button("🔄 초기화", use_container_width=True):
     st.session_state.s_key = os.urandom(4).hex()
     st.rerun()
@@ -129,6 +135,7 @@ def highlight(text, kws):
     for k in kws: text = re.sub(f"({re.escape(k)})", r"<mark class='highlight'>\1</mark>", text, flags=re.I)
     return text.replace("\n", "<br>")
 
+# 결과 출력
 if keyword:
     kws = keyword.split()
     query = "SELECT version, improvements, issues FROM notes WHERE " + " AND ".join(["raw_text LIKE ?" for _ in kws]) + " ORDER BY version DESC"
@@ -137,9 +144,10 @@ if keyword:
         st.markdown(f"<div class='version-title'>📦 TrusGuard {row['version']}</div>", unsafe_allow_html=True)
         all_c = (row['improvements'] + "\n" + row['issues']).split('\n')
         matched = [l for l in all_c if all(k.lower() in l.lower() for k in kws) and l.strip()]
-        st.markdown(f"<div class='report-card'>{highlight('\n'.join(matched) if matched else '*(본문 존재)*', kws)}</div>", unsafe_allow_html=True)
+        st.markdown(f"<div class='report-card'>{highlight('\n'.join(matched) if matched else '*(본문 내 존재)*', kws)}</div>", unsafe_allow_html=True)
 
 elif sel_v:
+    # 사이드바에서 선택한 버전 상세 보기
     r = pd.read_sql_query("SELECT * FROM notes WHERE version = ?", conn, params=[sel_v]).iloc[0]
     st.markdown(f"<div class='version-title'>📋 TrusGuard {r['version']} 상세 리포트</div>", unsafe_allow_html=True)
     st.markdown(f"""<div class='report-card'>
