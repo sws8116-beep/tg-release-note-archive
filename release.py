@@ -6,7 +6,7 @@ import re
 import os
 
 # --- 1. 페이지 스타일 및 레이아웃 설정 ---
-st.set_page_config(page_title="AhnLab TG 릴리즈 아카이브", layout="wide")
+st.set_page_config(page_title="보안팀 릴리즈 아카이브 Pro", layout="wide")
 
 st.markdown("""
     <style>
@@ -39,22 +39,34 @@ cursor.execute('''CREATE TABLE IF NOT EXISTS notes
                    improvements TEXT, issues TEXT, raw_text TEXT)''')
 conn.commit()
 
-# --- 3. 텍스트 정제 함수 ---
+# --- 3. [개선] 문장 잘림 방지 정제 함수 ---
 def clean_format(section_text):
     if not section_text: return ""
+    # 1. 모든 줄바꿈과 불필요한 공백을 하나로 합침 (문장 잘림 방지 핵심)
     text = re.sub(r'\s+', ' ', section_text).strip()
+    
+    # 2. 대괄호 '[' 가 시작되는 지점을 기준으로 나눔
+    # 예: "[모듈] 설명 [모듈2] 설명" -> ["", "[", "모듈] 설명 ", "[", "모듈2] 설명"]
     parts = re.split(r'(\[)', text)
-    formatted = []
-    if parts[0].strip(): formatted.append(f"• {parts[0].strip()}")
+    
+    formatted_lines = []
+    # 대괄호 전 문구가 있다면 추가
+    if parts[0].strip():
+        formatted_lines.append(f"* {parts[0].strip()}")
+        
     for i in range(1, len(parts), 2):
-        bracket, content = parts[i], parts[i+1] if i+1 < len(parts) else ""
-        formatted.append(f"• {bracket}{content.strip()}")
-    return "\n".join(formatted)
+        bracket = parts[i] # '['
+        content = parts[i+1] if i+1 < len(parts) else ""
+        # 대괄호 내부와 상세 설명을 하나의 리스트 항목으로 결합
+        line = f"* {bracket}{content.strip()}"
+        formatted_lines.append(line)
+        
+    return "\n".join(formatted_lines)
 
 # --- 4. 검색어 리셋 함수 ---
 def reset_search():
     st.session_state.search_input = ""
-    st.session_state.search_key = str(os.urandom(5)) # 입력창 강제 리셋용 키 변경
+    st.session_state.search_key = str(os.urandom(5))
 
 if 'search_key' not in st.session_state:
     st.session_state.search_key = "first_run"
@@ -66,7 +78,6 @@ with st.sidebar:
     
     selected_version = None
     if not history_df.empty:
-        # 라벨을 숨기고 라디오 버튼 배치
         selected_version = st.radio("상세 내용을 볼 버전을 선택하세요:", history_df['version'].tolist(), key="sidebar_radio")
     else:
         st.write("등록된 데이터가 없습니다.")
@@ -74,7 +85,6 @@ with st.sidebar:
     st.markdown("<br><br>", unsafe_allow_html=True)
     st.divider()
     
-    # 관리 기능 (Expander로 숨김)
     with st.expander("➕ PDF 신규 등록", expanded=False):
         files = st.file_uploader("파일 선택", accept_multiple_files=True, label_visibility="collapsed")
         if st.button("✅ DB 반영", use_container_width=True):
@@ -109,19 +119,19 @@ with st.sidebar:
             st.success("교체 완료!")
             st.rerun()
 
-# --- 6. 메인 화면 및 검색바 정렬 ---
+# --- 6. 메인 화면 및 검색바 정렬 (v17.2 수정) ---
 st.title("🛡️ TrusGuard 통합 릴리즈 관제센터")
 
-# vertical_alignment 옵션을 사용하여 버튼과 검색창 높이를 맞춤
+# 검색바와 초기화 버튼을 바닥선 기준으로 일직선 정렬
 col1, col2 = st.columns([5, 1], vertical_alignment="bottom")
 
 with col1:
     keyword = st.text_input("검색어 입력", placeholder="예: VPN 접속", key=st.session_state.search_key)
 
 with col2:
+    # 초기화 버튼 클릭 시 reset_search 함수 실행
     st.button("🔄 초기화", use_container_width=True, on_click=reset_search)
 
-# 텍스트 강조 함수
 def highlight_text(text, kws):
     if not kws: return text.replace("\n", "<br>")
     for k in kws:
