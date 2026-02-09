@@ -6,7 +6,7 @@ import re
 import os
 
 # --- 1. 페이지 설정 ---
-st.set_page_config(page_title="보안팀 릴리즈 아카이브 Pro v35.8", layout="wide")
+st.set_page_config(page_title="보안팀 릴리즈 아카이브 Pro v35.9", layout="wide")
 
 st.markdown("""
     <style>
@@ -25,51 +25,38 @@ cursor = conn.cursor()
 cursor.execute('''CREATE TABLE IF NOT EXISTS notes (id INTEGER PRIMARY KEY AUTOINCREMENT, version TEXT, openssl TEXT, openssh TEXT, improvements TEXT, issues TEXT, raw_text TEXT)''')
 conn.commit()
 
-# --- 3. [통합 엔진] 문장 복원 파싱 (v35.8 개선판) ---
-def robust_clean_text(text):
+# --- 3. [통합 엔진] 문장 복원 파싱 (v35.9 안정화) ---
+def clean_cell_text(text):
     """
-    깨진 텍스트, 괄호, 잘린 단어를 복원하는 초강력 세탁기
+    단일 셀 내부의 텍스트를 정리합니다. 줄바꿈을 공백으로 바꾸고 불필요한 공백을 제거합니다.
     """
     if not text: return ""
-    
-    # 1. 줄바꿈을 공백으로 변환
-    text = text.replace('\n', ' ')
-    
-    # 2. 하이픈으로 잘린 영단어 복원 (Ex: dae- mon -> daemon)
-    text = re.sub(r'([a-zA-Z])-\s+([a-zA-Z])', r'\1\2', text)
-    
-    # 3. 괄호 보정 (Ex: "( d" -> "(d", "( ." -> "(. ", " )" -> ")")
-    text = re.sub(r'\(\s+', '(', text)       # 여는 괄호 뒤 공백 제거
-    text = re.sub(r'\s+\)', ')', text)       # 닫는 괄호 앞 공백 제거
-    text = re.sub(r'\(\s*\.', '(.', text)    # (. 버전번호 등 보정
-    
-    # 4. 숫자/영어 사이의 불필요한 공백 보정 (버전 번호 등)
-    # Ex: . 4. 57 -> .4.57
-    text = re.sub(r'\.\s+(\d)', r'.\1', text)
+    text = str(text).replace('\n', ' ').strip()
+    return re.sub(r'\s+', ' ', text)
 
-    # 5. 다중 공백 제거
-    text = re.sub(r'\s+', ' ', text)
-    
-    return text.strip()
-
-def fix_split_words(line_str):
+def repair_broken_words_in_desc(text):
     """
-    [Type] Cat * Desc 구조에서 잘못 삽입된 * 구분자를 감지하여 단어를 붙임
-    Ex: System 펌웨 * 어 -> System 펌웨어
-    Ex: Apa * che -> Apache
+    [주의] 이 함수는 오직 '내용(Description)' 필드에만 적용됩니다.
+    카테고리와 내용 사이를 건드리지 않습니다.
     """
-    # 1. 영문이 * 를 사이에 두고 잘린 경우 (Apa * che -> Apache)
-    # 주의: 카테고리 구분이 사라지지만, 'Apa'라는 카테고리는 의미가 없으므로 합치는 게 이득
-    line_str = re.sub(r'([a-zA-Z])\s*\*\s*([a-zA-Z])', r'\1\2', line_str)
-    
-    # 2. 한글이 * 를 사이에 두고 잘린 경우 (펌웨 * 어 -> 펌웨어)
-    line_str = re.sub(r'([가-힣])\s*\*\s*([가-힣])', r'\1\2', line_str)
-    
-    # 3. CA 인증서 오류 보정 (C * A -> CA)
-    line_str = re.sub(r'(?i)\bC\s*\*\s*A\b', 'CA', line_str) # C * A -> CA
-    line_str = re.sub(r'(?i)\bC\s*\(A\b', 'CA', line_str)     # C (A -> CA (괄호 오인식 보정)
+    if not text: return ""
 
-    return line_str
+    # 1. 영어 단어 중간에 끼어든 하이픈/공백 제거 (Apa - che -> Apache)
+    text = re.sub(r'([a-zA-Z])\s*-\s*([a-zA-Z])', r'\1\2', text)
+    
+    # 2. 영어 단어 중간에 잘못 들어간 특수문자(*) 제거 (Apa * che -> Apache)
+    #    단, 앞뒤가 모두 알파벳일 때만 적용하여 오탐 최소화
+    text = re.sub(r'([a-zA-Z])\s*\*\s*([a-zA-Z])', r'\1\2', text)
+
+    # 3. 끊어진 한글 단어 복원 (펌웨 * 어 -> 펌웨어)
+    text = re.sub(r'([가-힣])\s*\*\s*([가-힣])', r'\1\2', text)
+
+    # 4. 괄호 보정 (소극적 적용)
+    #    "( Text" -> "(Text", "Text )" -> "Text)"
+    text = re.sub(r'\(\s+', '(', text)
+    text = re.sub(r'\s+\)', ')', text)
+
+    return text
 
 def parse_pdf_v35(file):
     with pdfplumber.open(file) as pdf:
@@ -80,13 +67,10 @@ def parse_pdf_v35(file):
             p_text = page.extract_text() or ""
             full_raw += p_text + "\n"
             
-            # [전략 개선] 표 추출 옵션 강화
-            # intersection_x_tolerance: 옆 칸 글자가 침범하는 것을 방지 (기본값보다 낮게 설정 시도)
+            # [롤백] v35.8의 intersection_x_tolerance 제거 (데이터 잘림 방지)
             strategies = [
-                # 전략 1: 선이 명확한 경우
-                {"vertical_strategy": "lines", "horizontal_strategy": "lines", "snap_tolerance": 5, "intersection_x_tolerance": 5},
-                # 전략 2: 선이 없고 공백으로 구분된 경우 (텍스트 기반)
-                {"vertical_strategy": "text", "horizontal_strategy": "text", "snap_tolerance": 8, "min_words_vertical": 2}
+                {"vertical_strategy": "lines", "horizontal_strategy": "lines", "snap_tolerance": 4},
+                {"vertical_strategy": "text", "horizontal_strategy": "text", "snap_tolerance": 5}
             ]
             
             for settings in strategies:
@@ -98,11 +82,10 @@ def parse_pdf_v35(file):
                 
                 for table in tables:
                     for row in table:
-                        # None 데이터 방어
-                        cells = [str(c).strip() if c else "" for c in row]
+                        # 1. 셀 데이터 1차 클리닝 (줄바꿈 제거)
+                        cells = [clean_cell_text(c) for c in row]
                         
                         if not cells or len(cells) < 2: continue
-                        # 헤더 스킵
                         if any(x in cells[0] for x in ["구분", "Type", "분류"]) or any(x in cells[1] for x in ["항목", "기능분류"]): continue
 
                         v_type = cells[0]
@@ -110,7 +93,7 @@ def parse_pdf_v35(file):
                         v_desc_raw = cells[2] if len(cells) > 2 else "" 
                         v_id = cells[3] if len(cells) > 3 else ""
 
-                        # Forward Fill (이전 값 채우기)
+                        # Forward Fill
                         if v_type: last_type = v_type
                         else: v_type = last_type
                         
@@ -119,53 +102,49 @@ def parse_pdf_v35(file):
 
                         target_keywords = ['개선', '신규', '이슈', '수정', 'BUG', 'TASK', 'Feature', '기능']
                         
-                        # 키워드가 타입에 있고, 내용이 존재할 때
                         if v_desc_raw and any(k in v_type for k in target_keywords):
                             
-                            # 1. 불렛 기호 및 잡동사니 제거
-                            cleaned_desc = re.sub(r'[•\-o]\s*', '', v_desc_raw)
+                            # 2. 내용(Description) 필드만 따로 복원 수술 집도
+                            #    불렛 제거
+                            clean_desc = re.sub(r'^[•\-o]\s*', '', v_desc_raw)
+                            #    단어 복원 (Apa * che -> Apache)
+                            final_desc = repair_broken_words_in_desc(clean_desc)
                             
-                            # 2. 문장 복원 (줄바꿈 제거 및 공백 정리)
-                            final_desc = robust_clean_text(cleaned_desc)
-                            
-                            # 3. 카테고리 텍스트 정리
-                            final_cat = robust_clean_text(v_cat)
+                            # 3. 카테고리 필드 정리
+                            final_cat = clean_cell_text(v_cat)
 
-                            # 4. 문자열 조립
                             cat_part = f" {final_cat}" if final_cat else ""
                             id_part = f" ({v_id})" if v_id and v_id.lower() not in ["none", "", "-"] else ""
                             
-                            # 기본 형태 조립
-                            raw_line = f"[{v_type}]{cat_part} * {final_desc}{id_part}"
+                            # 4. 최종 조립 (구분자 * 양옆에 공백 보장)
+                            #    이 단계에서는 절대 텍스트를 merge 하지 않음 -> SystemApa 방지
+                            line_str = f"[{v_type}]{cat_part} * {final_desc}{id_part}"
                             
-                            # 5. [핵심] 조립 후 "봉합 수술" (Apa * che -> Apache)
-                            fixed_line = fix_split_words(raw_line)
-                            
-                            if fixed_line not in extracted_data:
-                                extracted_data.append(fixed_line)
+                            if line_str not in extracted_data:
+                                extracted_data.append(line_str)
             
-            # [보조 전략] 텍스트 라인 파싱 (표 인식 실패 시 백업)
+            # [보조] 텍스트 라인 파싱
             text_lines = p_text.split('\n')
             for l in text_lines:
-                clean_l = robust_clean_text(l)
+                clean_l = clean_cell_text(l)
                 if not clean_l: continue
 
-                # 대괄호로 시작하는 패턴 감지 [개선] ...
                 match_bracket = re.match(r'^[•\-]?\s*\[([^\]]+)\]\s*(.*)', clean_l)
                 if match_bracket:
                     tag, body = match_bracket.group(1), match_bracket.group(2)
                     if any(kw in tag for kw in ['개선', '신규', '이슈', '수정', 'BUG']):
+                        # 여기서도 body만 살짝 수술
+                        final_body = repair_broken_words_in_desc(body)
+                        
                         if '/' in tag:
                             t1, t2 = tag.split('/', 1)
-                            formatted = f"[{t1}] {t2} * {body}"
+                            formatted = f"[{t1}] {t2} * {final_body}"
                         else:
-                            formatted = f"[{tag}] * {body}"
+                            formatted = f"[{tag}] * {final_body}"
                         
-                        # 중복 방지 후 추가
                         if formatted not in extracted_data:
                             extracted_data.append(formatted)
 
-        # 메타데이터 (버전, OpenSSL 등 추출)
         v = re.search(r'TrusGuard\s+v?([\d\.]+)', full_raw, re.I)
         version = v.group(1) if v else "Unknown"
         ssl = re.search(r'OpenSSL\s+([\d\.]+[a-z]?)', full_raw, re.I)
@@ -220,7 +199,7 @@ with st.sidebar:
                 st.rerun()
 
 # --- 5. 메인 렌더링 ---
-st.title("🛡️ TrusGuard 통합 관제 (v35.8)")
+st.title("🛡️ TrusGuard 통합 관제 (v35.9)")
 
 c1, c2 = st.columns([5,1], vertical_alignment="bottom")
 keyword = c1.text_input("검색어 입력", key=st.session_state.s_key)
