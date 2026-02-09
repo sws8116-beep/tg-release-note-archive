@@ -6,7 +6,7 @@ import re
 import os
 
 # --- 1. 페이지 설정 ---
-st.set_page_config(page_title="보안팀 릴리즈 아카이브 Pro v35.13", layout="wide")
+st.set_page_config(page_title="보안팀 릴리즈 아카이브 Pro v35.14", layout="wide")
 
 st.markdown("""
     <style>
@@ -18,7 +18,7 @@ st.markdown("""
     </style>
     """, unsafe_allow_html=True)
 
-# --- 2. DB 연결 및 초기화 함수 ---
+# --- 2. DB 연결 및 초기화 ---
 DB_FILE = 'security_notes_archive.db'
 
 def get_connection():
@@ -31,18 +31,17 @@ def init_db():
     conn.commit()
     conn.close()
 
-# 앱 시작 시 DB 체크
 init_db()
 
-# --- 3. [통합 엔진] v35.13 (노이즈 필터링 강화) ---
+# --- 3. [통합 엔진] v35.14 (Raw Text Parsing) ---
 
-def clean_cell_text(text):
+def clean_text(text):
     if not text: return ""
     return re.sub(r'\s+', ' ', str(text).replace('\n', ' ')).strip()
 
 def repair_content(text):
     if not text: return ""
-    # Apa * che, 펌웨 * 어 복구
+    # Apa * che 복구
     text = re.sub(r'([a-zA-Z])\s*[\*\-]\s*([a-zA-Z])', r'\1\2', text)
     text = re.sub(r'([가-힣])\s*[\*\-]\s*([가-힣])', r'\1\2', text)
     # 괄호 보정
@@ -55,106 +54,99 @@ def parse_pdf_v35(file):
         full_raw = ""
         extracted_data = [] 
         
+        # 전체 텍스트 수집 (페이지 구분 없이 통으로 처리)
         for page in pdf.pages:
-            p_text = page.extract_text() or ""
-            full_raw += p_text + "\n"
+            p_text = page.extract_text()
+            if p_text:
+                full_raw += p_text + "\n"
+        
+        # --- [전략] 라인 기반 스캐닝 (Table 포기) ---
+        lines = full_raw.split('\n')
+        
+        current_type = ""
+        current_cat = ""
+        current_desc = []
+        
+        # 처리할 키워드 (시작점 식별자)
+        type_keywords = ['개선', '신규', '이슈', '수정', 'BUG', 'Feature', '기능', '↑', '+']
+        cat_keywords = ['System', 'SSL', 'VPN', 'Network', 'Dashboard', 'Log', 'IPSec', 'Policy']
+        
+        for line in lines:
+            line = line.strip()
+            if not line: continue
             
-            # --- 전략 수립 ---
-            strategies = []
+            # 1. 새 항목의 시작인지 검사
+            #    패턴: [유형] 혹은 아이콘(↑, +)으로 시작하거나, 카테고리(System)가 맨 앞에 오는 경우
             
-            # 1. [스마트 그리드] 헤더 좌표 탐색
-            words = page.extract_words()
-            header_map = {w['text']: w for w in words if w['text'] in ['유형', '기능분류', '요약']}
+            # (1) 명시적 태그 [개선] ...
+            tag_match = re.match(r'^[•\-]?\s*\[([^\]]+)\]\s*(.*)', line)
             
-            if '기능분류' in header_map and '요약' in header_map:
-                x1 = (header_map['유형']['x1'] + header_map['기능분류']['x0']) / 2 if '유형' in header_map else header_map['기능분류']['x0'] - 10
-                x2 = (header_map['기능분류']['x1'] + header_map['요약']['x0']) / 2
-                strategies.append({
-                    "name": "smart",
-                    "vertical_strategy": "explicit", "explicit_vertical_lines": [0, x1, x2, page.width],
-                    "horizontal_strategy": "text", "intersection_y_tolerance": 10
-                })
+            # (2) 아이콘이나 단순 텍스트로 시작하는 경우 (테이블이 깨져서 줄바꿈 된 경우)
+            is_new_start = False
+            found_type = ""
             
-            # 2. [물리적 선]
-            strategies.append({"name": "lines", "vertical_strategy": "lines", "horizontal_strategy": "lines"})
+            if tag_match:
+                is_new_start = True
+                found_type = tag_match.group(1)
+                rest_line = tag_match.group(2)
+            else:
+                # 줄의 시작이 키워드 중 하나인지 확인
+                first_word = line.split()[0] if line.split() else ""
+                if any(k in first_word for k in type_keywords) or any(k in first_word for k in cat_keywords):
+                     is_new_start = True
+                     # 타입 추정 (키워드 매칭)
+                     if any(k in first_word for k in type_keywords):
+                         found_type = first_word
+                     else:
+                         found_type = "기타" # 카테고리로 시작하면 타입은 모름
+                     rest_line = line[len(first_word):].strip()
+                elif len(current_desc) > 0:
+                     # 시작이 아니면 이전 항목의 내용(Description)으로 이어 붙임
+                     current_desc.append(line)
+                     continue
             
-            # 3. [강제 하드코딩] A4 가로폭(약 600) 기준 대략적인 3단 분할
-            #    유형(좁음) | 분류(중간) | 요약(넓음)
-            strategies.append({
-                "name": "hardcoded",
-                "vertical_strategy": "explicit", "explicit_vertical_lines": [0, 50, 150, page.width],
-                "horizontal_strategy": "text", "intersection_y_tolerance": 10
-            })
-            
-            page_extracted = False
-            
-            for settings in strategies:
-                if page_extracted: break
-                try:
-                    tables = page.extract_tables(table_settings=settings)
-                except: continue
+            if is_new_start:
+                # 이전 항목 저장
+                if current_desc:
+                    full_desc = " ".join(current_desc)
+                    full_desc = repair_content(full_desc) # 내용 복구
+                    
+                    # 카테고리 추출 시도 (내용 앞부분에 영어가 있으면 카테고리로 간주)
+                    # 예: "System Apache..." -> Cat: System, Desc: Apache...
+                    detected_cat = ""
+                    
+                    # 이전 루프에서 유지된 카테고리 사용 or 새로 추출
+                    split_desc = full_desc.split(' ', 1)
+                    if len(split_desc) > 1 and any(c in split_desc[0] for c in cat_keywords):
+                        detected_cat = split_desc[0]
+                        final_desc = split_desc[1]
+                    else:
+                        detected_cat = current_cat # 앞선 항목의 카테고리 상속
+                        final_desc = full_desc
 
-                if not tables: continue
-                
-                temp_data = []
-                for table in tables:
-                    for row in table:
-                        cells = [clean_cell_text(c) for c in row]
-                        if not cells: continue
+                    # 필터링
+                    if len(final_desc) > 5 and not any(x in final_desc for x in ["Last Updated", "릴리즈노트", "페이지"]):
+                        # 아이콘 치환
+                        final_type = current_type.replace('↑', '개선').replace('+', '신규')
                         
-                        v_type = v_cat = v_desc = v_id = ""
+                        cat_str = f" {detected_cat}" if detected_cat else ""
+                        formatted = f"[{final_type}]{cat_str} * {final_desc}"
                         
-                        # 컬럼 매핑 (유연하게)
-                        if len(cells) >= 3:
-                            v_type, v_cat, v_desc = cells[0], cells[1], cells[2]
-                            v_id = cells[3] if len(cells) > 3 else ""
-                        elif len(cells) == 2: # 텍스트 모드 등에서 2개만 잡힐 때
-                             v_type, v_desc = cells[0], cells[1]
+                        if formatted not in extracted_data:
+                            extracted_data.append(formatted)
 
-                        # [필터링 1] 헤더 행 스킵
-                        if "유형" in v_type and "분류" in v_cat: continue
-
-                        # [필터링 2] 불필요한 링크/메타데이터 스킵 (여기가 핵심)
-                        if any(x in v_type for x in ["[릴리즈노트]", "문서", "제약사항", "다운로드", "제품명"]): continue
-                        if "Last Updated" in v_desc or "Build" in v_desc: continue
-                        if not v_desc or len(v_desc) < 5: continue # 너무 짧은 내용 버림
-
-                        # 키워드 검사 (기호 포함)
-                        keywords = ['개선', '신규', '이슈', '수정', 'BUG', '+', '↑', 'System', 'SSL', 'VPN', 'Network']
-                        
-                        is_valid = False
-                        # 내용이나 분류에 키워드가 있어야 함
-                        if any(k in v_type for k in keywords) or any(k in v_cat for k in keywords) or any(k in v_desc for k in keywords):
-                            is_valid = True
-                        
-                        if is_valid:
-                            # 1. 정제
-                            clean_desc = re.sub(r'^[•\-o]\s*', '', v_desc)
-                            clean_desc = repair_content(clean_desc)
-                            
-                            # 2. Type/Cat 분리
-                            # SystemApa -> System Apache
-                            final_cat = re.sub(r'(System)([A-Z])', r'\1 \2', v_cat)
-                            final_cat = re.sub(r'(SSL\s*VPN)([가-힣a-zA-Z])', r'\1 \2', final_cat)
-
-                            # 3. Type 아이콘 치환
-                            final_type = v_type.replace('↑', '개선').replace('+', '신규')
-                            
-                            cat_part = f" {final_cat}" if final_cat and final_cat != final_type else ""
-                            id_part = f" ({v_id})" if v_id and v_id not in ["-", ""] else ""
-                            
-                            line_str = f"[{final_type}]{cat_part} * {clean_desc}{id_part}"
-                            
-                            if line_str not in temp_data:
-                                temp_data.append(line_str)
-                
-                # 데이터가 3건 이상 나오면 성공으로 간주
-                if len(temp_data) >= 3:
-                    extracted_data.extend(temp_data)
-                    page_extracted = True
-            
-        # 중복 제거
-        extracted_data = list(dict.fromkeys(extracted_data))
+                # 상태 초기화 및 새 항목 시작
+                current_type = found_type
+                # 카테고리는 현재 줄에 있을 수도, 다음 줄에 있을 수도 있음. 일단 초기화 안하고 유지(Forward Fill)하거나 현재 줄에서 찾음
+                current_desc = [rest_line] if rest_line else []
+        
+        # 마지막 항목 저장
+        if current_desc:
+            full_desc = " ".join(current_desc)
+            full_desc = repair_content(full_desc)
+            final_type = current_type.replace('↑', '개선').replace('+', '신규')
+            formatted = f"[{final_type}] * {full_desc}"
+            extracted_data.append(formatted)
 
         # 메타데이터
         v = re.search(r'TrusGuard\s+v?([0-9\.]+)', full_raw, re.I)
@@ -209,25 +201,23 @@ with st.sidebar:
                         st.error(f"오류: {e}")
                 st.rerun()
 
-    # [NEW] DB 완전 초기화 메뉴
+    # DB 초기화 메뉴
     st.divider()
-    with st.expander("💀 관리자 메뉴 (위험)"):
-        if st.button("💣 DB 완전 초기화 (복구 불가)", type="primary"):
+    with st.expander("💀 관리자 메뉴"):
+        if st.button("💣 DB 초기화", type="primary"):
             cursor.execute("DROP TABLE IF EXISTS notes")
             conn.commit()
-            init_db() # 테이블 재생성
-            st.toast("DB가 초기화되었습니다.")
+            init_db()
             st.rerun()
-
         if not hist_df.empty:
             del_v = st.selectbox("삭제 버전", hist_df['version'].tolist())
-            if st.button("🚨 선택 버전 삭제"):
+            if st.button("🚨 삭제"):
                 cursor.execute("DELETE FROM notes WHERE version = ?", (del_v,))
                 conn.commit()
                 st.rerun()
 
 # --- 5. 메인 렌더링 ---
-st.title("🛡️ TrusGuard 통합 관제 (v35.13)")
+st.title("🛡️ TrusGuard 통합 관제 (v35.14)")
 
 c1, c2 = st.columns([5,1], vertical_alignment="bottom")
 keyword = c1.text_input("검색어 입력", key=st.session_state.s_key)
