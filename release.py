@@ -6,7 +6,7 @@ import re
 import os
 
 # --- 1. 페이지 설정 ---
-st.set_page_config(page_title="보안팀 릴리즈 아카이브 Pro v35.20", layout="wide")
+st.set_page_config(page_title="보안팀 릴리즈 아카이브 Pro v35.21", layout="wide")
 
 st.markdown("""
     <style>
@@ -34,7 +34,7 @@ def init_db():
 
 init_db()
 
-# --- 3. [통합 엔진] v35.20 (문장 분절기 탑재) ---
+# --- 3. [통합 엔진] v35.21 (정규식 오류 수정판) ---
 
 def clean_text(text):
     if not text: return ""
@@ -50,26 +50,37 @@ def repair_content(text):
 
 def split_long_blob(text):
     """
-    [핵심] 여러 문장이 뭉친 긴 텍스트를 서술어 기준으로 쪼개서 리스트로 반환
+    [수정됨] 캡처 그룹을 사용하여 문장을 분리하고 다시 조립
     """
-    if len(text) < 50: return [text] # 짧으면 그냥 리턴
+    if len(text) < 50: return [text]
 
-    # 문장을 끝맺는 핵심 키워드 패턴
-    # (?<=...) : 긍정형 후방 탐색 (Lookbehind) - 패턴이 매칭된 후 그 위치를 기준으로 자름
-    # 개선, 수정, 추가, 제공, 삭제, 변경, 현상, 않음, 실패, 실패함
-    pattern = r'(?<=(?:개선|수정|추가|제공|삭제|변경|현상|않음|실패|실패함))(?=\s+[가-힣A-Za-z])'
+    # 분할 기준 키워드 (괄호로 묶어서 split 결과에 포함되게 함)
+    # 뒤에 공백이나 문장 끝이 오는 경우만 매칭하여 오탐 방지
+    keywords = r'(개선|수정|추가|제공|삭제|변경|현상|않음|실패|실패함|완료)(?=\s|$)'
     
-    # 1. 정규식으로 분할 시도
-    split_lines = re.split(pattern, text)
+    # 1. 분할 (내용, 키워드, 내용, 키워드... 순으로 리스트 생성됨)
+    parts = re.split(keywords, text)
     
-    # 2. 결과 검증 (너무 짧게 잘린 건 다시 붙이거나 버림)
     results = []
-    for s in split_lines:
-        s = s.strip()
-        if len(s) > 5: # 최소 5글자 이상일 때만 유효 문장으로 인정
-            results.append(s)
+    current_sent = ""
+    
+    for part in parts:
+        if not part: continue
+        
+        # 키워드인지 확인 (정규식 패턴에 있는 단어인지)
+        if re.match(r'^(개선|수정|추가|제공|삭제|변경|현상|않음|실패|실패함|완료)$', part):
+            current_sent += part # 문장에 키워드 붙임 (문장 완성)
+            results.append(current_sent.strip())
+            current_sent = "" # 초기화
+        else:
+            current_sent += part # 문장 내용 누적
             
-    return results if results else [text]
+    # 남은 찌꺼기 처리
+    if current_sent.strip():
+        results.append(current_sent.strip())
+            
+    # 너무 짧은 문장(5글자 미만) 필터링
+    return [s for s in results if len(s) > 5]
 
 def parse_pdf_v35(file):
     with pdfplumber.open(file) as pdf:
@@ -117,7 +128,7 @@ def parse_pdf_v35(file):
             first_word = line.split()[0] if line else ""
             if any(k in first_word for k in cat_keywords):
                 cat_start_match = True
-            # "주요 Bug 수정" 같은 헤더 감지
+            
             bug_header = "Bug 수정" in line or "버그 수정" in line
 
             if tag_match:
@@ -135,9 +146,8 @@ def parse_pdf_v35(file):
                 else: found_type = '[개선]'
                 if not rest_line: rest_line = line[1:].strip()
             elif bug_header:
-                # 헤더 라인은 저장하지 않고 타입만 변경
                 current_type = "[이슈]"
-                current_desc = [] # 버퍼 비움
+                current_desc = [] 
                 continue 
             elif cat_start_match:
                 is_new_start = True
@@ -147,12 +157,10 @@ def parse_pdf_v35(file):
                 found_cat = current_cat
 
             if is_new_start:
-                # 이전 버퍼 저장
                 if current_desc:
                     full_desc = " ".join(current_desc)
                     full_desc = repair_content(full_desc)
                     
-                    # [분절기 작동] 한 덩어리를 여러 문장으로 쪼갬
                     split_sentences = split_long_blob(full_desc)
                     
                     for sent in split_sentences:
@@ -173,7 +181,6 @@ def parse_pdf_v35(file):
             else:
                 current_desc.append(line)
         
-        # 마지막 버퍼 처리
         if current_desc:
             full_desc = " ".join(current_desc)
             full_desc = repair_content(full_desc)
@@ -261,7 +268,7 @@ with st.sidebar:
                 st.rerun()
 
 # --- 5. 메인 렌더링 ---
-st.title("🛡️ TrusGuard 통합 관제 (v35.20)")
+st.title("🛡️ TrusGuard 통합 관제 (v35.21)")
 
 c1, c2 = st.columns([5,1], vertical_alignment="bottom")
 keyword = c1.text_input("검색어 입력", key=st.session_state.s_key)
