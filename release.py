@@ -6,7 +6,7 @@ import re
 import os
 
 # --- 1. 페이지 설정 ---
-st.set_page_config(page_title="보안팀 릴리즈 아카이브 Pro v35.12", layout="wide")
+st.set_page_config(page_title="보안팀 릴리즈 아카이브 Pro v35.13", layout="wide")
 
 st.markdown("""
     <style>
@@ -18,60 +18,37 @@ st.markdown("""
     </style>
     """, unsafe_allow_html=True)
 
-# --- 2. DB 연결 ---
+# --- 2. DB 연결 및 초기화 함수 ---
 DB_FILE = 'security_notes_archive.db'
-conn = sqlite3.connect(DB_FILE, check_same_thread=False)
-cursor = conn.cursor()
-cursor.execute('''CREATE TABLE IF NOT EXISTS notes (id INTEGER PRIMARY KEY AUTOINCREMENT, version TEXT, openssl TEXT, openssh TEXT, improvements TEXT, issues TEXT, raw_text TEXT)''')
-conn.commit()
 
-# --- 3. [통합 엔진] v35.12 최종 병기 ---
+def get_connection():
+    return sqlite3.connect(DB_FILE, check_same_thread=False)
+
+def init_db():
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute('''CREATE TABLE IF NOT EXISTS notes (id INTEGER PRIMARY KEY AUTOINCREMENT, version TEXT, openssl TEXT, openssh TEXT, improvements TEXT, issues TEXT, raw_text TEXT)''')
+    conn.commit()
+    conn.close()
+
+# 앱 시작 시 DB 체크
+init_db()
+
+# --- 3. [통합 엔진] v35.13 (노이즈 필터링 강화) ---
 
 def clean_cell_text(text):
     if not text: return ""
     return re.sub(r'\s+', ' ', str(text).replace('\n', ' ')).strip()
 
-def split_glued_words(text):
-    """
-    'SystemApa' 처럼 카테고리와 내용이 들러붙은 경우를 분리
-    """
-    # System 뒤에 대문자가 바로 오면 분리 (SystemApache -> System Apache)
-    text = re.sub(r'(System)([A-Z])', r'\1 \2', text)
-    # SSL VPN 뒤에 글자가 붙으면 분리
-    text = re.sub(r'(SSL\s*VPN)([가-힣a-zA-Z])', r'\1 \2', text)
-    return text
-
 def repair_content(text):
-    """
-    내용(Description) 필드 전용 복구 로직
-    """
     if not text: return ""
-    # 1. Apa * che, 펌웨 * 어 복구
+    # Apa * che, 펌웨 * 어 복구
     text = re.sub(r'([a-zA-Z])\s*[\*\-]\s*([a-zA-Z])', r'\1\2', text)
     text = re.sub(r'([가-힣])\s*[\*\-]\s*([가-힣])', r'\1\2', text)
-    
-    # 2. 괄호 보정
+    # 괄호 보정
     text = re.sub(r'\(\s+', '(', text)
     text = re.sub(r'\s+\)', ')', text)
     return text
-
-def find_column_separators(page):
-    words = page.extract_words()
-    header_map = {}
-    for w in words:
-        if w['text'] in ['유형', '기능분류', '요약']:
-            if w['text'] not in header_map: header_map[w['text']] = w
-            
-    if '기능분류' not in header_map or '요약' not in header_map:
-        return None
-
-    x_start = 0
-    # 유형~분류 사이
-    x1 = (header_map['유형']['x1'] + header_map['기능분류']['x0']) / 2 if '유형' in header_map else header_map['기능분류']['x0'] - 10
-    # 분류~요약 사이
-    x2 = (header_map['기능분류']['x1'] + header_map['요약']['x0']) / 2
-    
-    return [x_start, x1, x2, page.width]
 
 def parse_pdf_v35(file):
     with pdfplumber.open(file) as pdf:
@@ -85,16 +62,29 @@ def parse_pdf_v35(file):
             # --- 전략 수립 ---
             strategies = []
             
-            separators = find_column_separators(page)
-            if separators:
+            # 1. [스마트 그리드] 헤더 좌표 탐색
+            words = page.extract_words()
+            header_map = {w['text']: w for w in words if w['text'] in ['유형', '기능분류', '요약']}
+            
+            if '기능분류' in header_map and '요약' in header_map:
+                x1 = (header_map['유형']['x1'] + header_map['기능분류']['x0']) / 2 if '유형' in header_map else header_map['기능분류']['x0'] - 10
+                x2 = (header_map['기능분류']['x1'] + header_map['요약']['x0']) / 2
                 strategies.append({
-                    "name": "explicit",
-                    "vertical_strategy": "explicit", "explicit_vertical_lines": separators,
-                    "horizontal_strategy": "text", "intersection_y_tolerance": 5
+                    "name": "smart",
+                    "vertical_strategy": "explicit", "explicit_vertical_lines": [0, x1, x2, page.width],
+                    "horizontal_strategy": "text", "intersection_y_tolerance": 10
                 })
             
+            # 2. [물리적 선]
             strategies.append({"name": "lines", "vertical_strategy": "lines", "horizontal_strategy": "lines"})
-            strategies.append({"name": "text", "vertical_strategy": "text", "horizontal_strategy": "text"})
+            
+            # 3. [강제 하드코딩] A4 가로폭(약 600) 기준 대략적인 3단 분할
+            #    유형(좁음) | 분류(중간) | 요약(넓음)
+            strategies.append({
+                "name": "hardcoded",
+                "vertical_strategy": "explicit", "explicit_vertical_lines": [0, 50, 150, page.width],
+                "horizontal_strategy": "text", "intersection_y_tolerance": 10
+            })
             
             page_extracted = False
             
@@ -112,43 +102,42 @@ def parse_pdf_v35(file):
                         cells = [clean_cell_text(c) for c in row]
                         if not cells: continue
                         
-                        # 컬럼 매핑 (유동적)
                         v_type = v_cat = v_desc = v_id = ""
                         
+                        # 컬럼 매핑 (유연하게)
                         if len(cells) >= 3:
                             v_type, v_cat, v_desc = cells[0], cells[1], cells[2]
                             v_id = cells[3] if len(cells) > 3 else ""
-                        elif len(cells) == 2 and settings['name'] == 'text':
-                            # 텍스트 모드에서 2칸만 나온 경우 (유형+분류 / 내용)
-                            v_type = cells[0]
-                            v_desc = cells[1]
-                        else:
-                            continue
+                        elif len(cells) == 2: # 텍스트 모드 등에서 2개만 잡힐 때
+                             v_type, v_desc = cells[0], cells[1]
 
-                        # 헤더 스킵
+                        # [필터링 1] 헤더 행 스킵
                         if "유형" in v_type and "분류" in v_cat: continue
 
+                        # [필터링 2] 불필요한 링크/메타데이터 스킵 (여기가 핵심)
+                        if any(x in v_type for x in ["[릴리즈노트]", "문서", "제약사항", "다운로드", "제품명"]): continue
+                        if "Last Updated" in v_desc or "Build" in v_desc: continue
+                        if not v_desc or len(v_desc) < 5: continue # 너무 짧은 내용 버림
+
                         # 키워드 검사 (기호 포함)
-                        # v_type이나 v_cat에 키워드가 있거나, 아이콘(+, ↑)이 있으면 통과
-                        keywords = ['개선', '신규', '이슈', '수정', 'BUG', 'Feature', '+', '↑', 'System']
+                        keywords = ['개선', '신규', '이슈', '수정', 'BUG', '+', '↑', 'System', 'SSL', 'VPN', 'Network']
                         
                         is_valid = False
-                        if v_desc:
-                            if any(k in v_type for k in keywords) or any(k in v_cat for k in keywords):
-                                is_valid = True
-                            # 텍스트 모드 등에서 Type에 내용이 섞인 경우
-                            elif any(k in v_desc for k in keywords): 
-                                is_valid = True
+                        # 내용이나 분류에 키워드가 있어야 함
+                        if any(k in v_type for k in keywords) or any(k in v_cat for k in keywords) or any(k in v_desc for k in keywords):
+                            is_valid = True
                         
                         if is_valid:
                             # 1. 정제
                             clean_desc = re.sub(r'^[•\-o]\s*', '', v_desc)
                             clean_desc = repair_content(clean_desc)
                             
-                            # 2. SystemApa 분리
-                            final_cat = split_glued_words(v_cat)
-                            
-                            # 3. Type 정제 (아이콘만 있으면 텍스트로 치환 시도하거나 그대로 둠)
+                            # 2. Type/Cat 분리
+                            # SystemApa -> System Apache
+                            final_cat = re.sub(r'(System)([A-Z])', r'\1 \2', v_cat)
+                            final_cat = re.sub(r'(SSL\s*VPN)([가-힣a-zA-Z])', r'\1 \2', final_cat)
+
+                            # 3. Type 아이콘 치환
                             final_type = v_type.replace('↑', '개선').replace('+', '신규')
                             
                             cat_part = f" {final_cat}" if final_cat and final_cat != final_type else ""
@@ -159,28 +148,18 @@ def parse_pdf_v35(file):
                             if line_str not in temp_data:
                                 temp_data.append(line_str)
                 
-                if temp_data:
+                # 데이터가 3건 이상 나오면 성공으로 간주
+                if len(temp_data) >= 3:
                     extracted_data.extend(temp_data)
                     page_extracted = True
             
-            # [최후의 보루] 테이블 파싱이 모두 실패했다면 텍스트 라인에서 직접 추출
-            if not page_extracted:
-                lines = p_text.split('\n')
-                for l in lines:
-                    l = clean_cell_text(l)
-                    # [ ] 패턴이 있는 줄만 추출
-                    if re.match(r'^[•\-]?\s*\[', l):
-                         extracted_data.append(l)
-
         # 중복 제거
         extracted_data = list(dict.fromkeys(extracted_data))
 
-        # 메타데이터 (정규식 개선)
+        # 메타데이터
         v = re.search(r'TrusGuard\s+v?([0-9\.]+)', full_raw, re.I)
         version = v.group(1) if v else "Unknown"
         
-        # OpenSSL: 화살표가 있으면 뒤에꺼, 없으면 그냥 숫자
-        # 예: 1.1.1 -> 3.0.9  => 3.0.9 추출
         ssl_match = re.search(r'OpenSSL.*?(?:->\s*|\s)([\d\.]+[a-z]?)', full_raw, re.I)
         openssl = ssl_match.group(1) if ssl_match else "-"
         
@@ -197,6 +176,9 @@ def parse_pdf_v35(file):
 
 # --- 4. 사이드바 ---
 if 's_key' not in st.session_state: st.session_state.s_key = "v35"
+
+conn = get_connection()
+cursor = conn.cursor()
 
 with st.sidebar:
     st.header("📜 버전 히스토리")
@@ -227,16 +209,25 @@ with st.sidebar:
                         st.error(f"오류: {e}")
                 st.rerun()
 
-    with st.expander("🗑️ 데이터 삭제"):
+    # [NEW] DB 완전 초기화 메뉴
+    st.divider()
+    with st.expander("💀 관리자 메뉴 (위험)"):
+        if st.button("💣 DB 완전 초기화 (복구 불가)", type="primary"):
+            cursor.execute("DROP TABLE IF EXISTS notes")
+            conn.commit()
+            init_db() # 테이블 재생성
+            st.toast("DB가 초기화되었습니다.")
+            st.rerun()
+
         if not hist_df.empty:
             del_v = st.selectbox("삭제 버전", hist_df['version'].tolist())
-            if st.button("🚨 삭제"):
+            if st.button("🚨 선택 버전 삭제"):
                 cursor.execute("DELETE FROM notes WHERE version = ?", (del_v,))
                 conn.commit()
                 st.rerun()
 
 # --- 5. 메인 렌더링 ---
-st.title("🛡️ TrusGuard 통합 관제 (v35.12)")
+st.title("🛡️ TrusGuard 통합 관제 (v35.13)")
 
 c1, c2 = st.columns([5,1], vertical_alignment="bottom")
 keyword = c1.text_input("검색어 입력", key=st.session_state.s_key)
