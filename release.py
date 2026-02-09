@@ -6,7 +6,7 @@ import re
 import os
 
 # --- 1. 페이지 설정 ---
-st.set_page_config(page_title="보안팀 릴리즈 아카이브 Pro v35.18", layout="wide")
+st.set_page_config(page_title="보안팀 릴리즈 아카이브 Pro v35.19", layout="wide")
 
 st.markdown("""
     <style>
@@ -34,7 +34,7 @@ def init_db():
 
 init_db()
 
-# --- 3. [통합 엔진] v35.18 (완성형 파서) ---
+# --- 3. [통합 엔진] v35.19 (노이즈 킬러) ---
 
 def clean_text(text):
     if not text: return ""
@@ -65,17 +65,26 @@ def parse_pdf_v35(file):
         current_cat = ""
         current_desc = []
         
+        # [강력 필터링] 쓰레기 문구 목록
         ignore_keywords = [
-            '[릴리즈노트]', '제약사항', '다운로드', '관련 문서', 'Build', 'Last Updated', 
-            'http', 'TrusGuard_', 'AhnLab', 'Copyright', 'All rights reserved', '개인정보처리방침'
+            '[릴리즈노트]', '제약사항', '제약 사항', '다운로드', '관련 문서', 'Build', 'Last Updated', 
+            'http', 'TrusGuard_', 'AhnLab', 'Copyright', 'All rights reserved', '개인정보처리방침',
+            '카테고리 검색', '구독하기', '만듦', '편집된 시간', 'WARNING', '반출', '동의하는 자',
+            '제품명', '펌웨어', '해쉬값', '클라이언트', 'for Windows', 'for Android', 'for iOS', 
+            'for Linux', 'for MacOS', 'package', '서명값', 'DIP Client', '릴리스 일시', '주요 내용'
         ]
+        
         cat_keywords = ['System', 'Network', 'SSL', 'VPN', 'IPSec', 'Dashboard', 'Log', 'Policy', 'Object', 'Monitor']
 
         for line in lines:
             line = line.strip()
             if not line: continue
+            
+            # 1. 노이즈 제거
             if any(k in line for k in ignore_keywords): continue
             if re.match(r'^\d{4}\.', line): continue
+            # 경로 정보 제거 (ATAC > ...)
+            if '>' in line and 'TrusGuard' in line: continue
             
             is_new_start = False
             found_type = ""
@@ -83,7 +92,7 @@ def parse_pdf_v35(file):
             rest_line = ""
 
             tag_match = re.match(r'^[•\-]?\s*(\[[^\]]+\])\s*(.*)', line)
-            icon_start = any(line.startswith(x) for x in ['↑', '+'])
+            icon_start = any(line.startswith(x) for x in ['↑', '+', '🔼']) # 🔼 추가
             
             cat_start_match = None
             first_word = line.split()[0] if line else ""
@@ -92,14 +101,22 @@ def parse_pdf_v35(file):
 
             if tag_match:
                 tag = tag_match.group(1)
+                # Improvement 등 영문 태그도 처리하고 싶다면 여기에 추가
                 if '릴리즈' not in tag and '제약' not in tag:
                     is_new_start = True
                     found_type = tag
                     rest_line = tag_match.group(2)
             elif icon_start:
                 is_new_start = True
-                found_type = '[신규]' if line.startswith('+') else '[개선]'
-                rest_line = line[1:].strip()
+                # 🔼 Improvement 대응
+                if 'Improvement' in line: 
+                    found_type = '[개선]'
+                    rest_line = line.replace('Improvement', '').replace('🔼', '').strip()
+                elif line.startswith('+'): found_type = '[신규]'
+                else: found_type = '[개선]'
+                
+                if not rest_line: rest_line = line[1:].strip()
+
             elif cat_start_match:
                 is_new_start = True
                 found_type = current_type
@@ -112,11 +129,13 @@ def parse_pdf_v35(file):
                     full_desc = " ".join(current_desc)
                     full_desc = repair_content(full_desc)
                     if len(full_desc) > 5:
-                        final_type = current_type.replace('↑', '개선').replace('+', '신규').replace('[', '').replace(']', '')
+                        final_type = current_type.replace('↑', '개선').replace('+', '신규').replace('🔼', '개선').replace('[', '').replace(']', '')
                         type_str = f"[{final_type}]" if final_type and final_type != "항목" else ""
                         cat_str = f" {current_cat}" if current_cat else ""
+                        
                         if not type_str and not cat_str: formatted = f"* {full_desc}"
                         else: formatted = f"{type_str}{cat_str} * {full_desc}"
+                        
                         if formatted not in extracted_data: extracted_data.append(formatted)
 
                 current_type = found_type
@@ -130,7 +149,7 @@ def parse_pdf_v35(file):
             full_desc = " ".join(current_desc)
             full_desc = repair_content(full_desc)
             if len(full_desc) > 5:
-                final_type = current_type.replace('↑', '개선').replace('+', '신규').replace('[', '').replace(']', '')
+                final_type = current_type.replace('↑', '개선').replace('+', '신규').replace('🔼', '개선').replace('[', '').replace(']', '')
                 type_str = f"[{final_type}]" if final_type and final_type != "항목" else ""
                 cat_str = f" {current_cat}" if current_cat else ""
                 if not type_str and not cat_str: formatted = f"* {full_desc}"
@@ -155,7 +174,6 @@ def parse_pdf_v35(file):
 # --- 4. 사이드바 ---
 if 's_key' not in st.session_state: st.session_state.s_key = "v35"
 
-# 사이드바용 DB 연결 (주의: 파일 덮어쓰기 시 닫아야 함)
 conn = get_connection()
 cursor = conn.cursor()
 
@@ -188,52 +206,31 @@ with st.sidebar:
                         st.error(f"오류: {e}")
                 st.rerun()
 
-    # --- [NEW] 관리자 메뉴 (업/다운로드) ---
-    st.divider()
-    with st.expander("💀 관리자 메뉴 (DB 백업/복원)"):
-        # 1. 다운로드
+    with st.expander("💀 관리자 메뉴"):
         with open(DB_FILE, "rb") as f:
-            st.download_button(
-                label="💾 DB 다운로드 (백업)",
-                data=f,
-                file_name="security_notes_archive.db",
-                mime="application/x-sqlite3",
-                use_container_width=True
-            )
+            st.download_button("💾 DB 다운로드", f, "security_notes_archive.db", "application/x-sqlite3", use_container_width=True)
         
-        st.markdown("---")
-        
-        # 2. 업로드 (복원)
-        uploaded_db = st.file_uploader("📂 DB 업로드 (복원)", type=["db"])
-        if uploaded_db:
-            if st.button("⚠️ 현재 DB 덮어쓰기 (복구 불가)", type="primary", use_container_width=True):
-                # 기존 연결 종료 (Lock 방지)
-                conn.close()
-                # 파일 덮어쓰기
-                with open(DB_FILE, "wb") as f:
-                    f.write(uploaded_db.getbuffer())
-                st.success("DB가 성공적으로 복원되었습니다! 새로고침합니다.")
-                st.rerun()
-                
-        st.markdown("---")
+        uploaded_db = st.file_uploader("📂 DB 복원", type=["db"])
+        if uploaded_db and st.button("⚠️ 덮어쓰기"):
+            conn.close()
+            with open(DB_FILE, "wb") as f: f.write(uploaded_db.getbuffer())
+            st.rerun()
 
-        # 3. 초기화/삭제
-        if st.button("💣 DB 완전 초기화", type="secondary"):
-            conn.close() # 안전하게 닫고
-            if os.path.exists(DB_FILE):
-                os.remove(DB_FILE)
+        if st.button("💣 초기화"):
+            conn.close()
+            if os.path.exists(DB_FILE): os.remove(DB_FILE)
             init_db()
             st.rerun()
 
         if not hist_df.empty:
-            del_v = st.selectbox("삭제 버전", hist_df['version'].tolist())
-            if st.button("🚨 버전 삭제"):
+            del_v = st.selectbox("삭제", hist_df['version'].tolist())
+            if st.button("🚨 삭제"):
                 cursor.execute("DELETE FROM notes WHERE version = ?", (del_v,))
                 conn.commit()
                 st.rerun()
 
 # --- 5. 메인 렌더링 ---
-st.title("🛡️ TrusGuard 통합 관제 (v35.18)")
+st.title("🛡️ TrusGuard 통합 관제 (v35.19)")
 
 c1, c2 = st.columns([5,1], vertical_alignment="bottom")
 keyword = c1.text_input("검색어 입력", key=st.session_state.s_key)
