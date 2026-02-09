@@ -6,7 +6,7 @@ import re
 import os
 
 # --- 1. 페이지 설정 ---
-st.set_page_config(page_title="보안팀 릴리즈 아카이브 Pro v35.17", layout="wide")
+st.set_page_config(page_title="보안팀 릴리즈 아카이브 Pro v35.18", layout="wide")
 
 st.markdown("""
     <style>
@@ -34,7 +34,7 @@ def init_db():
 
 init_db()
 
-# --- 3. [통합 엔진] v35.17 (정제 및 UI 개선) ---
+# --- 3. [통합 엔진] v35.18 (완성형 파서) ---
 
 def clean_text(text):
     if not text: return ""
@@ -56,7 +56,7 @@ def parse_pdf_v35(file):
         for page in pdf.pages:
             p_text = page.extract_text()
             if p_text:
-                p_text = re.sub(r'\d+\s*/\s*\d+', '', p_text) # 페이지 번호 제거
+                p_text = re.sub(r'\d+\s*/\s*\d+', '', p_text)
                 full_raw += p_text + "\n"
         
         lines = full_raw.split('\n')
@@ -65,18 +65,15 @@ def parse_pdf_v35(file):
         current_cat = ""
         current_desc = []
         
-        # [필터링] 제외할 키워드 추가
         ignore_keywords = [
             '[릴리즈노트]', '제약사항', '다운로드', '관련 문서', 'Build', 'Last Updated', 
             'http', 'TrusGuard_', 'AhnLab', 'Copyright', 'All rights reserved', '개인정보처리방침'
         ]
-        
         cat_keywords = ['System', 'Network', 'SSL', 'VPN', 'IPSec', 'Dashboard', 'Log', 'Policy', 'Object', 'Monitor']
 
         for line in lines:
             line = line.strip()
             if not line: continue
-            
             if any(k in line for k in ignore_keywords): continue
             if re.match(r'^\d{4}\.', line): continue
             
@@ -105,7 +102,7 @@ def parse_pdf_v35(file):
                 rest_line = line[1:].strip()
             elif cat_start_match:
                 is_new_start = True
-                found_type = current_type # 이전 타입 상속
+                found_type = current_type
                 current_cat = first_word
                 rest_line = line[len(first_word):].strip()
                 found_cat = current_cat
@@ -114,27 +111,17 @@ def parse_pdf_v35(file):
                 if current_desc:
                     full_desc = " ".join(current_desc)
                     full_desc = repair_content(full_desc)
-                    
                     if len(full_desc) > 5:
                         final_type = current_type.replace('↑', '개선').replace('+', '신규').replace('[', '').replace(']', '')
-                        
-                        # [항목] 제거 로직: 타입이 없으면 그냥 불렛(*)만 표시
                         type_str = f"[{final_type}]" if final_type and final_type != "항목" else ""
                         cat_str = f" {current_cat}" if current_cat else ""
-                        
-                        # 타입이 아예 없으면 기본 포맷
-                        if not type_str and not cat_str:
-                            formatted = f"* {full_desc}"
-                        else:
-                            formatted = f"{type_str}{cat_str} * {full_desc}"
-                        
-                        if formatted not in extracted_data:
-                            extracted_data.append(formatted)
+                        if not type_str and not cat_str: formatted = f"* {full_desc}"
+                        else: formatted = f"{type_str}{cat_str} * {full_desc}"
+                        if formatted not in extracted_data: extracted_data.append(formatted)
 
                 current_type = found_type
                 if found_cat: current_cat = found_cat
                 elif tag_match or icon_start: current_cat = "" 
-                
                 current_desc = [rest_line] if rest_line else []
             else:
                 current_desc.append(line)
@@ -150,15 +137,10 @@ def parse_pdf_v35(file):
                 else: formatted = f"{type_str}{cat_str} * {full_desc}"
                 extracted_data.append(formatted)
 
-        # 메타데이터 (Full Line 추출)
         v = re.search(r'TrusGuard\s+v?([0-9\.]+)', full_raw, re.I)
         version = v.group(1) if v else "Unknown"
-        
-        # OpenSSL: 전체 라인 가져오기
         ssl_match_full = re.search(r'(OpenSSL.*)', full_raw, re.I)
         openssl = ssl_match_full.group(1).strip() if ssl_match_full else "OpenSSL: -"
-        
-        # OpenSSH: 전체 라인 가져오기
         ssh_match_full = re.search(r'(OpenSSH.*)', full_raw, re.I)
         openssh = ssh_match_full.group(1).strip() if ssh_match_full else "OpenSSH: -"
 
@@ -173,6 +155,7 @@ def parse_pdf_v35(file):
 # --- 4. 사이드바 ---
 if 's_key' not in st.session_state: st.session_state.s_key = "v35"
 
+# 사이드바용 DB 연결 (주의: 파일 덮어쓰기 시 닫아야 함)
 conn = get_connection()
 cursor = conn.cursor()
 
@@ -205,21 +188,52 @@ with st.sidebar:
                         st.error(f"오류: {e}")
                 st.rerun()
 
-    with st.expander("💀 관리자 메뉴"):
-        if st.button("💣 DB 초기화", type="primary"):
-            cursor.execute("DROP TABLE IF EXISTS notes")
-            conn.commit()
+    # --- [NEW] 관리자 메뉴 (업/다운로드) ---
+    st.divider()
+    with st.expander("💀 관리자 메뉴 (DB 백업/복원)"):
+        # 1. 다운로드
+        with open(DB_FILE, "rb") as f:
+            st.download_button(
+                label="💾 DB 다운로드 (백업)",
+                data=f,
+                file_name="security_notes_archive.db",
+                mime="application/x-sqlite3",
+                use_container_width=True
+            )
+        
+        st.markdown("---")
+        
+        # 2. 업로드 (복원)
+        uploaded_db = st.file_uploader("📂 DB 업로드 (복원)", type=["db"])
+        if uploaded_db:
+            if st.button("⚠️ 현재 DB 덮어쓰기 (복구 불가)", type="primary", use_container_width=True):
+                # 기존 연결 종료 (Lock 방지)
+                conn.close()
+                # 파일 덮어쓰기
+                with open(DB_FILE, "wb") as f:
+                    f.write(uploaded_db.getbuffer())
+                st.success("DB가 성공적으로 복원되었습니다! 새로고침합니다.")
+                st.rerun()
+                
+        st.markdown("---")
+
+        # 3. 초기화/삭제
+        if st.button("💣 DB 완전 초기화", type="secondary"):
+            conn.close() # 안전하게 닫고
+            if os.path.exists(DB_FILE):
+                os.remove(DB_FILE)
             init_db()
             st.rerun()
+
         if not hist_df.empty:
             del_v = st.selectbox("삭제 버전", hist_df['version'].tolist())
-            if st.button("🚨 삭제"):
+            if st.button("🚨 버전 삭제"):
                 cursor.execute("DELETE FROM notes WHERE version = ?", (del_v,))
                 conn.commit()
                 st.rerun()
 
 # --- 5. 메인 렌더링 ---
-st.title("🛡️ TrusGuard 통합 관제 (v35.17)")
+st.title("🛡️ TrusGuard 통합 관제 (v35.18)")
 
 c1, c2 = st.columns([5,1], vertical_alignment="bottom")
 keyword = c1.text_input("검색어 입력", key=st.session_state.s_key)
@@ -232,7 +246,6 @@ def render_report_card(version, openssl, openssh, content, search_kws=None):
     with st.container():
         st.markdown("<div class='report-box'>", unsafe_allow_html=True)
         st.markdown(f"<div class='meta-label'>🔒 보안 컴포넌트</div>", unsafe_allow_html=True)
-        # 보안 컴포넌트 전체 라인 표시 (2줄)
         st.markdown(f"<div class='security-comp'>{openssl}</div>", unsafe_allow_html=True)
         st.markdown(f"<div class='security-comp'>{openssh}</div>", unsafe_allow_html=True)
         st.markdown("<br>", unsafe_allow_html=True)
