@@ -6,7 +6,7 @@ import re
 import os
 
 # --- 1. 페이지 설정 ---
-st.set_page_config(page_title="보안팀 릴리즈 아카이브 Pro v35.11", layout="wide")
+st.set_page_config(page_title="보안팀 릴리즈 아카이브 Pro v35.12", layout="wide")
 
 st.markdown("""
     <style>
@@ -25,22 +25,30 @@ cursor = conn.cursor()
 cursor.execute('''CREATE TABLE IF NOT EXISTS notes (id INTEGER PRIMARY KEY AUTOINCREMENT, version TEXT, openssl TEXT, openssh TEXT, improvements TEXT, issues TEXT, raw_text TEXT)''')
 conn.commit()
 
-# --- 3. [통합 엔진] 멀티 전략 파싱 (v35.11 최종형) ---
+# --- 3. [통합 엔진] v35.12 최종 병기 ---
 
 def clean_cell_text(text):
     if not text: return ""
-    # 줄바꿈을 공백으로, 다중 공백을 단일 공백으로
     return re.sub(r'\s+', ' ', str(text).replace('\n', ' ')).strip()
 
-def repair_broken_words_in_desc(text):
+def split_glued_words(text):
     """
-    텍스트 전략 사용 시 발생하는 분절 현상(Apa * che)을 복구하는 수술 도구
+    'SystemApa' 처럼 카테고리와 내용이 들러붙은 경우를 분리
+    """
+    # System 뒤에 대문자가 바로 오면 분리 (SystemApache -> System Apache)
+    text = re.sub(r'(System)([A-Z])', r'\1 \2', text)
+    # SSL VPN 뒤에 글자가 붙으면 분리
+    text = re.sub(r'(SSL\s*VPN)([가-힣a-zA-Z])', r'\1 \2', text)
+    return text
+
+def repair_content(text):
+    """
+    내용(Description) 필드 전용 복구 로직
     """
     if not text: return ""
-    # 1. 영어/한글 단어 중간에 끼어든 하이픈/공백/* 제거
-    text = re.sub(r'([a-zA-Z])\s*-\s*([a-zA-Z])', r'\1\2', text)
-    text = re.sub(r'([a-zA-Z])\s*\*\s*([a-zA-Z])', r'\1\2', text)
-    text = re.sub(r'([가-힣])\s*\*\s*([가-힣])', r'\1\2', text)
+    # 1. Apa * che, 펌웨 * 어 복구
+    text = re.sub(r'([a-zA-Z])\s*[\*\-]\s*([a-zA-Z])', r'\1\2', text)
+    text = re.sub(r'([가-힣])\s*[\*\-]\s*([가-힣])', r'\1\2', text)
     
     # 2. 괄호 보정
     text = re.sub(r'\(\s+', '(', text)
@@ -48,41 +56,28 @@ def repair_broken_words_in_desc(text):
     return text
 
 def find_column_separators(page):
-    """
-    페이지에서 헤더 좌표를 찾아 세로 구분선(Vertical Lines)을 계산
-    """
     words = page.extract_words()
     header_map = {}
-    
-    # 헤더 탐색 범위를 페이지 상단으로 제한하지 않고 전체 스캔하되, y값 비교
     for w in words:
         if w['text'] in ['유형', '기능분류', '요약']:
-            # 가장 상단에 등장하는 헤더만 신뢰
-            if w['text'] not in header_map:
-                header_map[w['text']] = w
+            if w['text'] not in header_map: header_map[w['text']] = w
             
-    # 핵심 헤더 2개가 없으면 좌표 계산 포기
     if '기능분류' not in header_map or '요약' not in header_map:
         return None
 
-    # 좌표 계산
     x_start = 0
-    # 유형이 있으면 유형~분류 사이, 없으면 0~분류 사이
+    # 유형~분류 사이
     x1 = (header_map['유형']['x1'] + header_map['기능분류']['x0']) / 2 if '유형' in header_map else header_map['기능분류']['x0'] - 10
-    
-    # 분류~요약 사이 (여기가 제일 중요)
+    # 분류~요약 사이
     x2 = (header_map['기능분류']['x1'] + header_map['요약']['x0']) / 2
     
-    x_end = page.width
-    
-    return [x_start, x1, x2, x_end]
+    return [x_start, x1, x2, page.width]
 
 def parse_pdf_v35(file):
     with pdfplumber.open(file) as pdf:
         full_raw = ""
         extracted_data = [] 
         
-        # 페이지별 순회
         for page in pdf.pages:
             p_text = page.extract_text() or ""
             full_raw += p_text + "\n"
@@ -90,116 +85,106 @@ def parse_pdf_v35(file):
             # --- 전략 수립 ---
             strategies = []
             
-            # 1. [스마트 그리드] 헤더 좌표 기반 강제 분할
             separators = find_column_separators(page)
             if separators:
                 strategies.append({
                     "name": "explicit",
-                    "vertical_strategy": "explicit",
-                    "explicit_vertical_lines": separators,
-                    "horizontal_strategy": "text",
-                    "intersection_y_tolerance": 5
+                    "vertical_strategy": "explicit", "explicit_vertical_lines": separators,
+                    "horizontal_strategy": "text", "intersection_y_tolerance": 5
                 })
             
-            # 2. [물리적 선] 실제 그려진 선이 있는 경우
-            strategies.append({
-                "name": "lines",
-                "vertical_strategy": "lines", 
-                "horizontal_strategy": "lines",
-                "snap_tolerance": 4
-            })
-            
-            # 3. [텍스트 분포] 선도 없고 헤더도 못 찾았을 때 (최후의 보루)
-            #    단, 이 경우 Apa * che 현상이 발생하므로 후처리 필수
-            strategies.append({
-                "name": "text",
-                "vertical_strategy": "text", 
-                "horizontal_strategy": "text"
-            })
+            strategies.append({"name": "lines", "vertical_strategy": "lines", "horizontal_strategy": "lines"})
+            strategies.append({"name": "text", "vertical_strategy": "text", "horizontal_strategy": "text"})
             
             page_extracted = False
             
             for settings in strategies:
-                if page_extracted: break # 이미 추출 성공했으면 다음 전략 스킵
-                
+                if page_extracted: break
                 try:
                     tables = page.extract_tables(table_settings=settings)
-                except:
-                    continue
+                except: continue
 
                 if not tables: continue
-
+                
                 temp_data = []
-                valid_rows = 0
-
                 for table in tables:
                     for row in table:
-                        # 데이터 정제
                         cells = [clean_cell_text(c) for c in row]
-                        
-                        # 최소한의 유효성 검사 (컬럼 수 부족하면 병합 시도 or 스킵)
                         if not cells: continue
                         
-                        # 컬럼 매핑 (전략에 따라 인덱스가 다를 수 있음)
-                        # 보통 [유형, 분류, 요약, ...] 순서
+                        # 컬럼 매핑 (유동적)
+                        v_type = v_cat = v_desc = v_id = ""
+                        
                         if len(cells) >= 3:
-                            v_type = cells[0]
-                            v_cat = cells[1]
-                            v_desc = cells[2]
+                            v_type, v_cat, v_desc = cells[0], cells[1], cells[2]
                             v_id = cells[3] if len(cells) > 3 else ""
                         elif len(cells) == 2 and settings['name'] == 'text':
-                            # 텍스트 전략에서 '유형'과 '분류'가 붙어나온 경우
-                            v_type = cells[0] # 여기에 유형+분류가 섞임
-                            v_cat = ""
+                            # 텍스트 모드에서 2칸만 나온 경우 (유형+분류 / 내용)
+                            v_type = cells[0]
                             v_desc = cells[1]
-                            v_id = ""
                         else:
                             continue
 
-                        # 헤더 행 스킵
-                        if any(x in v_type for x in ["유형", "구분", "Type"]) and any(x in v_desc for x in ["요약", "Summary"]): 
-                            continue
+                        # 헤더 스킵
+                        if "유형" in v_type and "분류" in v_cat: continue
 
-                        target_keywords = ['개선', '신규', '이슈', '수정', 'BUG', 'Feature', '기능']
+                        # 키워드 검사 (기호 포함)
+                        # v_type이나 v_cat에 키워드가 있거나, 아이콘(+, ↑)이 있으면 통과
+                        keywords = ['개선', '신규', '이슈', '수정', 'BUG', 'Feature', '+', '↑', 'System']
                         
-                        # 내용이 있고, 타입에 키워드가 있을 때 (혹은 타입이 비어있어도 내용이 확실하면)
-                        if v_desc and (any(k in v_type for k in target_keywords) or any(k in v_cat for k in target_keywords)):
-                            
-                            # 1. 불렛 제거
+                        is_valid = False
+                        if v_desc:
+                            if any(k in v_type for k in keywords) or any(k in v_cat for k in keywords):
+                                is_valid = True
+                            # 텍스트 모드 등에서 Type에 내용이 섞인 경우
+                            elif any(k in v_desc for k in keywords): 
+                                is_valid = True
+                        
+                        if is_valid:
+                            # 1. 정제
                             clean_desc = re.sub(r'^[•\-o]\s*', '', v_desc)
+                            clean_desc = repair_content(clean_desc)
                             
-                            # 2. [필수] 단어 봉합 수술 (어떤 전략이든 안전하게 한 번 돌림)
-                            final_desc = repair_broken_words_in_desc(clean_desc)
+                            # 2. SystemApa 분리
+                            final_cat = split_glued_words(v_cat)
                             
-                            cat_part = f" {v_cat}" if v_cat else ""
+                            # 3. Type 정제 (아이콘만 있으면 텍스트로 치환 시도하거나 그대로 둠)
+                            final_type = v_type.replace('↑', '개선').replace('+', '신규')
+                            
+                            cat_part = f" {final_cat}" if final_cat and final_cat != final_type else ""
                             id_part = f" ({v_id})" if v_id and v_id not in ["-", ""] else ""
                             
-                            line_str = f"[{v_type}]{cat_part} * {final_desc}{id_part}"
+                            line_str = f"[{final_type}]{cat_part} * {clean_desc}{id_part}"
                             
                             if line_str not in temp_data:
                                 temp_data.append(line_str)
-                                valid_rows += 1
                 
-                # 이 전략으로 유의미한 데이터(3행 이상)를 뽑았다면 채택
-                if valid_rows > 0:
+                if temp_data:
                     extracted_data.extend(temp_data)
                     page_extracted = True
-        
-        # 중복 제거 (페이지 넘어가며 중복 추출될 가능성 배제)
+            
+            # [최후의 보루] 테이블 파싱이 모두 실패했다면 텍스트 라인에서 직접 추출
+            if not page_extracted:
+                lines = p_text.split('\n')
+                for l in lines:
+                    l = clean_cell_text(l)
+                    # [ ] 패턴이 있는 줄만 추출
+                    if re.match(r'^[•\-]?\s*\[', l):
+                         extracted_data.append(l)
+
+        # 중복 제거
         extracted_data = list(dict.fromkeys(extracted_data))
 
-        # 메타데이터 추출 (정규식 강화)
-        # 1. 버전: TrusGuard 뒤의 숫자
+        # 메타데이터 (정규식 개선)
         v = re.search(r'TrusGuard\s+v?([0-9\.]+)', full_raw, re.I)
         version = v.group(1) if v else "Unknown"
         
-        # 2. OpenSSL: "OpenSSL" 문자열이 포함된 줄에서 숫자.숫자.숫자 패턴 찾기
-        #    Ex: OpenSSL 업그레이드 1.1.1 -> 3.0.9
-        ssl_match = re.search(r'OpenSSL.*?(\d+\.\d+\.\d+[a-z]?)', full_raw, re.I | re.DOTALL)
+        # OpenSSL: 화살표가 있으면 뒤에꺼, 없으면 그냥 숫자
+        # 예: 1.1.1 -> 3.0.9  => 3.0.9 추출
+        ssl_match = re.search(r'OpenSSL.*?(?:->\s*|\s)([\d\.]+[a-z]?)', full_raw, re.I)
         openssl = ssl_match.group(1) if ssl_match else "-"
         
-        # 3. OpenSSH
-        ssh_match = re.search(r'OpenSSH.*?(\d+\.\d+p\d+)', full_raw, re.I | re.DOTALL)
+        ssh_match = re.search(r'OpenSSH.*?([\d\.]+p\d+)', full_raw, re.I)
         openssh = ssh_match.group(1) if ssh_match else "-"
 
     return {
@@ -251,7 +236,7 @@ with st.sidebar:
                 st.rerun()
 
 # --- 5. 메인 렌더링 ---
-st.title("🛡️ TrusGuard 통합 관제 (v35.11)")
+st.title("🛡️ TrusGuard 통합 관제 (v35.12)")
 
 c1, c2 = st.columns([5,1], vertical_alignment="bottom")
 keyword = c1.text_input("검색어 입력", key=st.session_state.s_key)
