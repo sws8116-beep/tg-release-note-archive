@@ -6,7 +6,7 @@ import re
 import os
 
 # --- 1. 페이지 설정 ---
-st.set_page_config(page_title="보안팀 릴리즈 아카이브 Pro v35.19", layout="wide")
+st.set_page_config(page_title="보안팀 릴리즈 아카이브 Pro v35.20", layout="wide")
 
 st.markdown("""
     <style>
@@ -34,7 +34,7 @@ def init_db():
 
 init_db()
 
-# --- 3. [통합 엔진] v35.19 (노이즈 킬러) ---
+# --- 3. [통합 엔진] v35.20 (문장 분절기 탑재) ---
 
 def clean_text(text):
     if not text: return ""
@@ -47,6 +47,29 @@ def repair_content(text):
     text = re.sub(r'\(\s+', '(', text)
     text = re.sub(r'\s+\)', ')', text)
     return text
+
+def split_long_blob(text):
+    """
+    [핵심] 여러 문장이 뭉친 긴 텍스트를 서술어 기준으로 쪼개서 리스트로 반환
+    """
+    if len(text) < 50: return [text] # 짧으면 그냥 리턴
+
+    # 문장을 끝맺는 핵심 키워드 패턴
+    # (?<=...) : 긍정형 후방 탐색 (Lookbehind) - 패턴이 매칭된 후 그 위치를 기준으로 자름
+    # 개선, 수정, 추가, 제공, 삭제, 변경, 현상, 않음, 실패, 실패함
+    pattern = r'(?<=(?:개선|수정|추가|제공|삭제|변경|현상|않음|실패|실패함))(?=\s+[가-힣A-Za-z])'
+    
+    # 1. 정규식으로 분할 시도
+    split_lines = re.split(pattern, text)
+    
+    # 2. 결과 검증 (너무 짧게 잘린 건 다시 붙이거나 버림)
+    results = []
+    for s in split_lines:
+        s = s.strip()
+        if len(s) > 5: # 최소 5글자 이상일 때만 유효 문장으로 인정
+            results.append(s)
+            
+    return results if results else [text]
 
 def parse_pdf_v35(file):
     with pdfplumber.open(file) as pdf:
@@ -65,7 +88,6 @@ def parse_pdf_v35(file):
         current_cat = ""
         current_desc = []
         
-        # [강력 필터링] 쓰레기 문구 목록
         ignore_keywords = [
             '[릴리즈노트]', '제약사항', '제약 사항', '다운로드', '관련 문서', 'Build', 'Last Updated', 
             'http', 'TrusGuard_', 'AhnLab', 'Copyright', 'All rights reserved', '개인정보처리방침',
@@ -73,17 +95,14 @@ def parse_pdf_v35(file):
             '제품명', '펌웨어', '해쉬값', '클라이언트', 'for Windows', 'for Android', 'for iOS', 
             'for Linux', 'for MacOS', 'package', '서명값', 'DIP Client', '릴리스 일시', '주요 내용'
         ]
-        
-        cat_keywords = ['System', 'Network', 'SSL', 'VPN', 'IPSec', 'Dashboard', 'Log', 'Policy', 'Object', 'Monitor']
+        cat_keywords = ['System', 'Network', 'SSL', 'VPN', 'IPSec', 'Dashboard', 'Log', 'Policy', 'Object', 'Monitor', 'LDAP', 'IP']
 
         for line in lines:
             line = line.strip()
             if not line: continue
             
-            # 1. 노이즈 제거
             if any(k in line for k in ignore_keywords): continue
             if re.match(r'^\d{4}\.', line): continue
-            # 경로 정보 제거 (ATAC > ...)
             if '>' in line and 'TrusGuard' in line: continue
             
             is_new_start = False
@@ -92,31 +111,34 @@ def parse_pdf_v35(file):
             rest_line = ""
 
             tag_match = re.match(r'^[•\-]?\s*(\[[^\]]+\])\s*(.*)', line)
-            icon_start = any(line.startswith(x) for x in ['↑', '+', '🔼']) # 🔼 추가
+            icon_start = any(line.startswith(x) for x in ['↑', '+', '🔼'])
             
             cat_start_match = None
             first_word = line.split()[0] if line else ""
             if any(k in first_word for k in cat_keywords):
                 cat_start_match = True
+            # "주요 Bug 수정" 같은 헤더 감지
+            bug_header = "Bug 수정" in line or "버그 수정" in line
 
             if tag_match:
                 tag = tag_match.group(1)
-                # Improvement 등 영문 태그도 처리하고 싶다면 여기에 추가
                 if '릴리즈' not in tag and '제약' not in tag:
                     is_new_start = True
                     found_type = tag
                     rest_line = tag_match.group(2)
             elif icon_start:
                 is_new_start = True
-                # 🔼 Improvement 대응
                 if 'Improvement' in line: 
                     found_type = '[개선]'
                     rest_line = line.replace('Improvement', '').replace('🔼', '').strip()
                 elif line.startswith('+'): found_type = '[신규]'
                 else: found_type = '[개선]'
-                
                 if not rest_line: rest_line = line[1:].strip()
-
+            elif bug_header:
+                # 헤더 라인은 저장하지 않고 타입만 변경
+                current_type = "[이슈]"
+                current_desc = [] # 버퍼 비움
+                continue 
             elif cat_start_match:
                 is_new_start = True
                 found_type = current_type
@@ -125,18 +147,24 @@ def parse_pdf_v35(file):
                 found_cat = current_cat
 
             if is_new_start:
+                # 이전 버퍼 저장
                 if current_desc:
                     full_desc = " ".join(current_desc)
                     full_desc = repair_content(full_desc)
-                    if len(full_desc) > 5:
-                        final_type = current_type.replace('↑', '개선').replace('+', '신규').replace('🔼', '개선').replace('[', '').replace(']', '')
-                        type_str = f"[{final_type}]" if final_type and final_type != "항목" else ""
-                        cat_str = f" {current_cat}" if current_cat else ""
-                        
-                        if not type_str and not cat_str: formatted = f"* {full_desc}"
-                        else: formatted = f"{type_str}{cat_str} * {full_desc}"
-                        
-                        if formatted not in extracted_data: extracted_data.append(formatted)
+                    
+                    # [분절기 작동] 한 덩어리를 여러 문장으로 쪼갬
+                    split_sentences = split_long_blob(full_desc)
+                    
+                    for sent in split_sentences:
+                        if len(sent) > 5:
+                            final_type = current_type.replace('↑', '개선').replace('+', '신규').replace('🔼', '개선').replace('[', '').replace(']', '')
+                            type_str = f"[{final_type}]" if final_type and final_type != "항목" else ""
+                            cat_str = f" {current_cat}" if current_cat else ""
+                            
+                            if not type_str and not cat_str: formatted = f"* {sent}"
+                            else: formatted = f"{type_str}{cat_str} * {sent}"
+                            
+                            if formatted not in extracted_data: extracted_data.append(formatted)
 
                 current_type = found_type
                 if found_cat: current_cat = found_cat
@@ -145,16 +173,19 @@ def parse_pdf_v35(file):
             else:
                 current_desc.append(line)
         
+        # 마지막 버퍼 처리
         if current_desc:
             full_desc = " ".join(current_desc)
             full_desc = repair_content(full_desc)
-            if len(full_desc) > 5:
-                final_type = current_type.replace('↑', '개선').replace('+', '신규').replace('🔼', '개선').replace('[', '').replace(']', '')
-                type_str = f"[{final_type}]" if final_type and final_type != "항목" else ""
-                cat_str = f" {current_cat}" if current_cat else ""
-                if not type_str and not cat_str: formatted = f"* {full_desc}"
-                else: formatted = f"{type_str}{cat_str} * {full_desc}"
-                extracted_data.append(formatted)
+            split_sentences = split_long_blob(full_desc)
+            for sent in split_sentences:
+                if len(sent) > 5:
+                    final_type = current_type.replace('↑', '개선').replace('+', '신규').replace('🔼', '개선').replace('[', '').replace(']', '')
+                    type_str = f"[{final_type}]" if final_type and final_type != "항목" else ""
+                    cat_str = f" {current_cat}" if current_cat else ""
+                    if not type_str and not cat_str: formatted = f"* {sent}"
+                    else: formatted = f"{type_str}{cat_str} * {sent}"
+                    extracted_data.append(formatted)
 
         v = re.search(r'TrusGuard\s+v?([0-9\.]+)', full_raw, re.I)
         version = v.group(1) if v else "Unknown"
@@ -230,7 +261,7 @@ with st.sidebar:
                 st.rerun()
 
 # --- 5. 메인 렌더링 ---
-st.title("🛡️ TrusGuard 통합 관제 (v35.19)")
+st.title("🛡️ TrusGuard 통합 관제 (v35.20)")
 
 c1, c2 = st.columns([5,1], vertical_alignment="bottom")
 keyword = c1.text_input("검색어 입력", key=st.session_state.s_key)
