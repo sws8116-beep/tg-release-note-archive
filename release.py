@@ -6,7 +6,7 @@ import re
 import os
 
 # --- 1. 페이지 설정 ---
-st.set_page_config(page_title="보안팀 릴리즈 아카이브 Pro v35.9", layout="wide")
+st.set_page_config(page_title="보안팀 릴리즈 아카이브 Pro v35.10", layout="wide")
 
 st.markdown("""
     <style>
@@ -25,126 +25,128 @@ cursor = conn.cursor()
 cursor.execute('''CREATE TABLE IF NOT EXISTS notes (id INTEGER PRIMARY KEY AUTOINCREMENT, version TEXT, openssl TEXT, openssh TEXT, improvements TEXT, issues TEXT, raw_text TEXT)''')
 conn.commit()
 
-# --- 3. [통합 엔진] 문장 복원 파싱 (v35.9 안정화) ---
+# --- 3. [통합 엔진] Smart Grid 파싱 (v35.10 핵심) ---
 def clean_cell_text(text):
-    """
-    단일 셀 내부의 텍스트를 정리합니다. 줄바꿈을 공백으로 바꾸고 불필요한 공백을 제거합니다.
-    """
     if not text: return ""
-    text = str(text).replace('\n', ' ').strip()
-    return re.sub(r'\s+', ' ', text)
+    # 줄바꿈을 공백으로, 다중 공백을 단일 공백으로
+    return re.sub(r'\s+', ' ', str(text).replace('\n', ' ')).strip()
 
-def repair_broken_words_in_desc(text):
+def find_column_separators(page):
     """
-    [주의] 이 함수는 오직 '내용(Description)' 필드에만 적용됩니다.
-    카테고리와 내용 사이를 건드리지 않습니다.
+    페이지에서 '유형', '기능분류', '요약' 헤더의 좌표를 찾아
+    가장 완벽한 세로 구분선(Vertical Lines) 위치를 계산합니다.
     """
-    if not text: return ""
-
-    # 1. 영어 단어 중간에 끼어든 하이픈/공백 제거 (Apa - che -> Apache)
-    text = re.sub(r'([a-zA-Z])\s*-\s*([a-zA-Z])', r'\1\2', text)
+    words = page.extract_words()
     
-    # 2. 영어 단어 중간에 잘못 들어간 특수문자(*) 제거 (Apa * che -> Apache)
-    #    단, 앞뒤가 모두 알파벳일 때만 적용하여 오탐 최소화
-    text = re.sub(r'([a-zA-Z])\s*\*\s*([a-zA-Z])', r'\1\2', text)
+    # 헤더 단어 찾기
+    header_map = {}
+    for w in words:
+        if w['text'] in ['유형', '기능분류', '요약']:
+            header_map[w['text']] = w
+            
+    if len(header_map) < 3:
+        return None # 헤더를 못 찾으면 기본 전략 사용
 
-    # 3. 끊어진 한글 단어 복원 (펌웨 * 어 -> 펌웨어)
-    text = re.sub(r'([가-힣])\s*\*\s*([가-힣])', r'\1\2', text)
+    # 좌표 계산 (각 헤더의 중간 지점이나 끝 지점을 기준으로 분할)
+    # 1. 유형 ~ 기능분류 사이 선
+    x1 = (header_map['유형']['x1'] + header_map['기능분류']['x0']) / 2
+    
+    # 2. 기능분류 ~ 요약 사이 선 (여기가 제일 중요, Apa * che 방지)
+    x2 = (header_map['기능분류']['x1'] + header_map['요약']['x0']) / 2
+    
+    # 3. 요약 끝나는 지점 (페이지 우측 여백 고려)
+    x3 = page.width - 20 
 
-    # 4. 괄호 보정 (소극적 적용)
-    #    "( Text" -> "(Text", "Text )" -> "Text)"
-    text = re.sub(r'\(\s+', '(', text)
-    text = re.sub(r'\s+\)', ')', text)
-
-    return text
+    return [0, x1, x2, x3]
 
 def parse_pdf_v35(file):
     with pdfplumber.open(file) as pdf:
         full_raw = ""
         extracted_data = [] 
         
+        # 문서 전체의 기본 구분선 좌표 (첫 페이지 등에서 발견 시 저장)
+        default_separators = None
+
         for page in pdf.pages:
             p_text = page.extract_text() or ""
             full_raw += p_text + "\n"
             
-            # [롤백] v35.8의 intersection_x_tolerance 제거 (데이터 잘림 방지)
-            strategies = [
-                {"vertical_strategy": "lines", "horizontal_strategy": "lines", "snap_tolerance": 4},
-                {"vertical_strategy": "text", "horizontal_strategy": "text", "snap_tolerance": 5}
-            ]
+            # 1. 이 페이지에 맞는 '강제 구분선' 찾기
+            separators = find_column_separators(page)
+            if separators:
+                default_separators = separators # 찾았으면 캐싱 (다음 페이지를 위해)
+            elif default_separators:
+                separators = default_separators # 못 찾았으면 이전 페이지 설정 사용
             
-            for settings in strategies:
-                tables = page.extract_tables(table_settings=settings)
-                if not tables: continue
+            # 2. 테이블 추출 전략 수립
+            settings = {}
+            if separators:
+                # [핵심] 텍스트가 찢어지지 않게 좌표로 강제 분할 (explicit)
+                settings = {
+                    "vertical_strategy": "explicit",
+                    "explicit_vertical_lines": separators,
+                    "horizontal_strategy": "text", # 행은 텍스트 간격으로 구분
+                    "intersection_y_tolerance": 5  # 행 높이 관용구
+                }
+            else:
+                # 헤더도 없고 선도 안보이면 'lines' 전략 (기존 방식 fallback)
+                settings = {"vertical_strategy": "lines", "horizontal_strategy": "lines"}
 
-                last_type = ""
-                last_cat = ""
-                
-                for table in tables:
-                    for row in table:
-                        # 1. 셀 데이터 1차 클리닝 (줄바꿈 제거)
-                        cells = [clean_cell_text(c) for c in row]
-                        
-                        if not cells or len(cells) < 2: continue
-                        if any(x in cells[0] for x in ["구분", "Type", "분류"]) or any(x in cells[1] for x in ["항목", "기능분류"]): continue
-
-                        v_type = cells[0]
-                        v_cat = cells[1] if len(cells) > 1 else ""
-                        v_desc_raw = cells[2] if len(cells) > 2 else "" 
-                        v_id = cells[3] if len(cells) > 3 else ""
-
-                        # Forward Fill
-                        if v_type: last_type = v_type
-                        else: v_type = last_type
-                        
-                        if v_cat: last_cat = v_cat
-                        else: v_cat = last_cat
-
-                        target_keywords = ['개선', '신규', '이슈', '수정', 'BUG', 'TASK', 'Feature', '기능']
-                        
-                        if v_desc_raw and any(k in v_type for k in target_keywords):
-                            
-                            # 2. 내용(Description) 필드만 따로 복원 수술 집도
-                            #    불렛 제거
-                            clean_desc = re.sub(r'^[•\-o]\s*', '', v_desc_raw)
-                            #    단어 복원 (Apa * che -> Apache)
-                            final_desc = repair_broken_words_in_desc(clean_desc)
-                            
-                            # 3. 카테고리 필드 정리
-                            final_cat = clean_cell_text(v_cat)
-
-                            cat_part = f" {final_cat}" if final_cat else ""
-                            id_part = f" ({v_id})" if v_id and v_id.lower() not in ["none", "", "-"] else ""
-                            
-                            # 4. 최종 조립 (구분자 * 양옆에 공백 보장)
-                            #    이 단계에서는 절대 텍스트를 merge 하지 않음 -> SystemApa 방지
-                            line_str = f"[{v_type}]{cat_part} * {final_desc}{id_part}"
-                            
-                            if line_str not in extracted_data:
-                                extracted_data.append(line_str)
+            tables = page.extract_tables(table_settings=settings)
             
-            # [보조] 텍스트 라인 파싱
-            text_lines = p_text.split('\n')
-            for l in text_lines:
-                clean_l = clean_cell_text(l)
-                if not clean_l: continue
+            if not tables: continue
 
-                match_bracket = re.match(r'^[•\-]?\s*\[([^\]]+)\]\s*(.*)', clean_l)
-                if match_bracket:
-                    tag, body = match_bracket.group(1), match_bracket.group(2)
-                    if any(kw in tag for kw in ['개선', '신규', '이슈', '수정', 'BUG']):
-                        # 여기서도 body만 살짝 수술
-                        final_body = repair_broken_words_in_desc(body)
-                        
-                        if '/' in tag:
-                            t1, t2 = tag.split('/', 1)
-                            formatted = f"[{t1}] {t2} * {final_body}"
-                        else:
-                            formatted = f"[{tag}] * {final_body}"
-                        
-                        if formatted not in extracted_data:
-                            extracted_data.append(formatted)
+            last_type = ""
+            last_cat = ""
+            
+            for table in tables:
+                for row in table:
+                    # 셀 클리닝
+                    cells = [clean_cell_text(c) for c in row]
+                    
+                    # 데이터 검증 (최소 3개 컬럼 필요: 유형, 분류, 요약)
+                    if not cells or len(cells) < 3: continue
+                    
+                    # 헤더 행 스킵
+                    if any(x in cells[0] for x in ["유형", "구분", "Type"]) and any(x in cells[1] for x in ["기능분류", "Category"]): continue
 
+                    # 명시적 컬럼 매핑 (좌표로 잘랐으므로 인덱스가 정확함)
+                    v_type = cells[0]
+                    v_cat = cells[1]
+                    v_desc_raw = cells[2]
+                    v_id = cells[3] if len(cells) > 3 else ""
+
+                    # Forward Fill (빈칸이면 윗줄 값 가져오기)
+                    if v_type: last_type = v_type
+                    else: v_type = last_type
+                    
+                    if v_cat: last_cat = v_cat
+                    else: v_cat = last_cat
+
+                    target_keywords = ['개선', '신규', '이슈', '수정', 'BUG', 'Feature']
+                    
+                    # '내용'이 있고 '타입'이 유효할 때만 처리
+                    if v_desc_raw and any(k in v_type for k in target_keywords):
+                        
+                        # 1. 불렛 제거
+                        clean_desc = re.sub(r'^[•\-o]\s*', '', v_desc_raw)
+                        
+                        # 2. 텍스트 후처리 (AOS 설정) 괄호 보정 등
+                        #    Smart Grid를 썼으므로 Apa * che 같은 분절은 이미 사라졌음. 
+                        #    괄호 앞뒤 공백만 살짝 다듬어줍니다.
+                        clean_desc = re.sub(r'\(\s+', '(', clean_desc)
+                        clean_desc = re.sub(r'\s+\)', ')', clean_desc)
+                        
+                        cat_part = f" {v_cat}" if v_cat else ""
+                        id_part = f" ({v_id})" if v_id and v_id not in ["-", ""] else ""
+                        
+                        # 최종 포맷
+                        line_str = f"[{v_type}]{cat_part} * {clean_desc}{id_part}"
+                        
+                        if line_str not in extracted_data:
+                            extracted_data.append(line_str)
+
+        # 메타데이터 추출
         v = re.search(r'TrusGuard\s+v?([\d\.]+)', full_raw, re.I)
         version = v.group(1) if v else "Unknown"
         ssl = re.search(r'OpenSSL\s+([\d\.]+[a-z]?)', full_raw, re.I)
@@ -199,7 +201,7 @@ with st.sidebar:
                 st.rerun()
 
 # --- 5. 메인 렌더링 ---
-st.title("🛡️ TrusGuard 통합 관제 (v35.9)")
+st.title("🛡️ TrusGuard 통합 관제 (v35.10)")
 
 c1, c2 = st.columns([5,1], vertical_alignment="bottom")
 keyword = c1.text_input("검색어 입력", key=st.session_state.s_key)
