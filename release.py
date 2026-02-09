@@ -6,7 +6,7 @@ import re
 import os
 
 # --- 1. 페이지 설정 ---
-st.set_page_config(page_title="보안팀 릴리즈 아카이브 Pro v35.21", layout="wide")
+st.set_page_config(page_title="AhnLab TG 릴리즈노트 아카이브 Pro v35.21", layout="wide")
 
 st.markdown("""
     <style>
@@ -268,7 +268,7 @@ with st.sidebar:
                 st.rerun()
 
 # --- 5. 메인 렌더링 ---
-st.title("🛡️ TrusGuard 통합 관제 (v35.21)")
+st.title("🛡️ AhnLab TG 릴리즈노트 V1.0")
 
 c1, c2 = st.columns([5,1], vertical_alignment="bottom")
 keyword = c1.text_input("검색어 입력", key=st.session_state.s_key)
@@ -317,3 +317,4 @@ elif sel_v:
     render_report_card(r['version'], r['openssl'], r['openssh'], r['improvements'])
 else:
     st.info("좌측 사이드바에서 PDF 파일을 등록하거나 버전을 선택해주세요.")
+
