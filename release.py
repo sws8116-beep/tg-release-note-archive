@@ -5,58 +5,16 @@ import pandas as pd
 import re
 import os
 
-# --- 1. 페이지 설정 및 스타일 ---
-st.set_page_config(page_title="보안팀 릴리즈 아카이브 Pro v35.4", layout="wide")
+# --- 1. 페이지 설정 ---
+st.set_page_config(page_title="보안팀 릴리즈 아카이브 Pro v35.5", layout="wide")
 
 st.markdown("""
     <style>
-    /* 버전 타이틀 */
-    .version-header {
-        font-size: 24px; 
-        font-weight: 800; 
-        color: #0D47A1; 
-        background-color: #E3F2FD; 
-        padding: 15px; 
-        border-radius: 8px; 
-        border-left: 8px solid #1565C0;
-        margin-bottom: 15px;
-    }
-    /* 리포트 박스 */
-    .report-box {
-        padding: 20px; 
-        border: 1px solid #ddd; 
-        background-color: #ffffff; 
-        border-radius: 8px; 
-        margin-bottom: 25px;
-        box-shadow: 0 2px 4px rgba(0,0,0,0.05);
-    }
-    /* 개별 항목 */
-    .item-box {
-        padding: 10px 14px;
-        margin-bottom: 8px;
-        border-left: 4px solid #90CAF9;
-        background-color: #F5F5F5;
-        font-size: 15px;
-        line-height: 1.6;
-        color: #37474F;
-    }
-    /* 하이라이트 */
-    .highlight { 
-        background-color: #FFF59D; 
-        color: black; 
-        font-weight: bold; 
-        padding: 2px 4px;
-        border-radius: 4px;
-    }
-    /* 라벨 */
-    .meta-label {
-        color: #1565C0;
-        font-weight: bold;
-        font-size: 16px;
-        display: inline-block;
-        margin-bottom: 10px;
-        border-bottom: 2px solid #BBDEFB;
-    }
+    .version-header { font-size: 24px; font-weight: 800; color: #0D47A1; background-color: #E3F2FD; padding: 15px; border-radius: 8px; border-left: 8px solid #1565C0; margin-bottom: 15px; }
+    .report-box { padding: 20px; border: 1px solid #ddd; background-color: #ffffff; border-radius: 8px; margin-bottom: 25px; }
+    .item-box { padding: 10px 14px; margin-bottom: 8px; border-left: 4px solid #90CAF9; background-color: #F5F5F5; font-size: 15px; line-height: 1.6; }
+    .highlight { background-color: #FFF59D; color: black; font-weight: bold; padding: 2px 4px; border-radius: 4px; }
+    .meta-label { color: #1565C0; font-weight: bold; font-size: 16px; border-bottom: 2px solid #BBDEFB; margin-bottom: 10px; display: inline-block; }
     </style>
     """, unsafe_allow_html=True)
 
@@ -67,84 +25,113 @@ cursor = conn.cursor()
 cursor.execute('''CREATE TABLE IF NOT EXISTS notes (id INTEGER PRIMARY KEY AUTOINCREMENT, version TEXT, openssl TEXT, openssh TEXT, improvements TEXT, issues TEXT, raw_text TEXT)''')
 conn.commit()
 
-# --- 3. [통합 엔진] 데이터 파싱 (누락 방지 로직 강화) ---
+# --- 3. [통합 엔진] 다중 전략 파싱 (Robust Parsing) ---
 def parse_pdf_v35(file):
     with pdfplumber.open(file) as pdf:
         full_raw = ""
-        combined_list = []
-        last_type = ""
-        last_cat = ""
-
+        extracted_data = [] # 순서 유지용 리스트
+        
         for page in pdf.pages:
             p_text = page.extract_text() or ""
             full_raw += p_text + "\n"
             
-            # [A] 표 데이터 처리
-            tables = page.extract_tables()
-            for table in tables:
-                if not table: continue
-                for row in table:
-                    cells = [str(c).strip() if c else "" for c in row]
-                    # 헤더 행 스킵
-                    if not cells or cells[0] in ["구분", "Type", "분류"]: continue
-
-                    v_type = cells[0]
-                    v_cat = cells[1] if len(cells) > 1 else ""
-                    v_desc_raw = cells[2] if len(cells) > 2 else ""
-                    v_id = cells[3] if len(cells) > 3 else ""
-
-                    # Forward Fill (빈 칸 채우기)
-                    if v_type: last_type = v_type
-                    else: v_type = last_type
+            # ---------------------------------------------------------
+            # [전략 1 & 2] 표(Table) 추출 시도 (기본 + 텍스트 기반)
+            # ---------------------------------------------------------
+            # 설정 A: 기본 (선 기반)
+            # 설정 B: 텍스트 기반 (선 없는 표 대응) -> vertical_strategy: "text"
+            strategies = [
+                {}, 
+                {"vertical_strategy": "text", "horizontal_strategy": "text", "snap_tolerance": 5}
+            ]
+            
+            tables_found = False
+            for settings in strategies:
+                tables = page.extract_tables(table_settings=settings)
+                if tables:
+                    tables_found = True
+                    last_type = ""
+                    last_cat = ""
                     
-                    if v_cat: last_cat = v_cat
-                    else: v_cat = last_cat
-
-                    # [핵심 수정] 내용 추출 로직 완화
-                    if v_desc_raw:
-                        lines = v_desc_raw.split('\n')
-                        bullet_lines = []
-                        for line in lines:
-                            line = line.strip()
-                            # 불렛 포인트 찾기
-                            if line.startswith('•') or line.startswith('-') or line.startswith('o '):
-                                clean_line = re.sub(r'^[•\-o]\s*', '', line)
-                                bullet_lines.append(clean_line)
-                        
-                        # 1순위: 불렛 내용이 있으면 그것만 씀 (제목 제거 효과)
-                        if bullet_lines:
-                            final_desc = " ".join(bullet_lines)
-                        # 2순위: 불렛이 없으면 원본 전체를 다 씀 (데이터 누락 방지)
-                        else:
-                            final_desc = v_desc_raw.replace('\n', ' ')
-
-                        # 키워드 매칭 (유형에 '개선', '신규' 등이 있는지)
-                        target_keywords = ['개선', '신규', '이슈', '수정', 'BUG', 'TASK', 'Feature', '기능']
-                        if any(k in v_type for k in target_keywords):
-                            cat_part = f" {v_cat}" if v_cat else ""
-                            id_part = f" ({v_id})" if v_id and v_id.lower() not in ["none", "", "-"] else ""
+                    for table in tables:
+                        for row in table:
+                            # 데이터 정제
+                            cells = [str(c).strip() if c else "" for c in row]
                             
-                            # 포맷 조립
-                            assembled_line = f"[{v_type}]{cat_part} * {final_desc}{id_part}"
-                            combined_list.append(assembled_line)
+                            # 헤더나 빈 행 스킵
+                            if not cells or len(cells) < 2: continue
+                            if cells[0] in ["구분", "Type", "분류"] or cells[1] in ["항목", "기능분류"]: continue
 
-            # [B] 일반 텍스트 파싱
-            lines = p_text.split('\n')
-            for l in lines:
+                            # 매핑 (인덱스 안전 접근)
+                            v_type = cells[0]
+                            v_cat = cells[1] if len(cells) > 1 else ""
+                            v_desc_raw = cells[2] if len(cells) > 2 else ""
+                            v_id = cells[3] if len(cells) > 3 else ""
+
+                            # Forward Fill (빈 칸 채우기)
+                            if v_type: last_type = v_type
+                            else: v_type = last_type
+                            
+                            if v_cat: last_cat = v_cat
+                            else: v_cat = last_cat
+
+                            # 키워드 필터 (쓰레기 데이터 제거)
+                            target_keywords = ['개선', '신규', '이슈', '수정', 'BUG', 'TASK', 'Feature', '기능']
+                            if v_desc_raw and any(k in v_type for k in target_keywords):
+                                # 스마트 요약 (제목 제거)
+                                lines = v_desc_raw.split('\n')
+                                bullet_lines = [re.sub(r'^[•\-o]\s*', '', l.strip()) for l in lines if l.strip().startswith(('•', '-', 'o '))]
+                                final_desc = " ".join(bullet_lines) if bullet_lines else v_desc_raw.replace('\n', ' ')
+                                
+                                # 포맷팅
+                                cat_part = f" {v_cat}" if v_cat else ""
+                                id_part = f" ({v_id})" if v_id and v_id.lower() not in ["none", "", "-"] else ""
+                                line_str = f"[{v_type}]{cat_part} * {final_desc}{id_part}"
+                                
+                                if line_str not in extracted_data:
+                                    extracted_data.append(line_str)
+            
+            # ---------------------------------------------------------
+            # [전략 3] 텍스트 라인 파싱 (표 추출 실패 시 최후의 보루)
+            # ---------------------------------------------------------
+            # 표에서 데이터를 못 찾았거나, 보완이 필요할 때 실행
+            text_lines = p_text.split('\n')
+            for l in text_lines:
                 clean_l = l.strip()
-                match = re.match(r'^[•\-]?\s*\[([^\]]+)\]\s*(.*)', clean_l)
-                if match:
-                    tag_part = match.group(1)
-                    body_part = match.group(2)
-                    if any(kw in tag_part for kw in ['개선', '신규', '이슈', '수정', 'BUG']):
-                        if '/' in tag_part:
-                            t_type, t_cat = tag_part.split('/', 1)
-                            formatted = f"[{t_type}] {t_cat} * {body_part}"
-                        else:
-                            formatted = f"[{tag_part}] * {body_part}"
-                        combined_list.append(formatted)
+                if not clean_l: continue
 
-        # 메타데이터 추출
+                # 패턴 1: [신규] ... (대괄호 있음)
+                match_bracket = re.match(r'^[•\-]?\s*\[([^\]]+)\]\s*(.*)', clean_l)
+                
+                # 패턴 2: 신규 ... (대괄호 없이 키워드로 시작)
+                # 예: "신규 SSL VPN ..." -> 정규식으로 잡아냄
+                match_no_bracket = re.match(r'^(개선|신규|이슈|수정|BUG|TASK)\s+([a-zA-Z0-9_/]+)?\s*(.*)', clean_l)
+
+                formatted = ""
+                if match_bracket:
+                    tag, body = match_bracket.group(1), match_bracket.group(2)
+                    if any(kw in tag for kw in ['개선', '신규', '이슈', '수정']):
+                        if '/' in tag:
+                            t1, t2 = tag.split('/', 1)
+                            formatted = f"[{t1}] {t2} * {body}"
+                        else:
+                            formatted = f"[{tag}] * {body}"
+                
+                elif match_no_bracket:
+                    # 표가 깨져서 텍스트로만 읽힐 때 유용
+                    k_type = match_no_bracket.group(1)
+                    k_cat = match_no_bracket.group(2) or ""
+                    k_desc = match_no_bracket.group(3)
+                    
+                    # 너무 짧은 건 제목(Header)일 수 있으니 제외
+                    if len(k_desc) > 5: 
+                        formatted = f"[{k_type}] {k_cat} * {k_desc}"
+
+                # 중복 방지 후 추가
+                if formatted and formatted not in extracted_data:
+                    extracted_data.append(formatted)
+
+        # 메타데이터
         v = re.search(r'TrusGuard\s+v?([\d\.]+)', full_raw, re.I)
         version = v.group(1) if v else "Unknown"
         ssl = re.search(r'OpenSSL\s+([\d\.]+[a-z]?)', full_raw, re.I)
@@ -154,7 +141,7 @@ def parse_pdf_v35(file):
         "version": version,
         "openssl": ssl.group(1) if ssl else "-",
         "openssh": ssh.group(1) if ssh else "-",
-        "content": "\n\n".join(dict.fromkeys(combined_list)), # 중복 제거
+        "content": "\n\n".join(extracted_data),
         "raw": full_raw
     }
 
@@ -178,20 +165,17 @@ with st.sidebar:
                 for f in uploaded:
                     try:
                         info = parse_pdf_v35(f)
-                        # 중복 체크 후 저장
                         cursor.execute("SELECT version FROM notes WHERE version = ?", (info['version'],))
                         if not cursor.fetchone():
                             cursor.execute("INSERT INTO notes (version, openssl, openssh, improvements, issues, raw_text) VALUES (?,?,?,?,?,?)",
                                         (info['version'], info['openssl'], info['openssh'], info['content'], "", info['raw']))
                             conn.commit()
-                            st.success(f"v{info['version']} 저장됨")
+                            st.success(f"v{info['version']} 저장됨 ({len(info['content'].splitlines())} 건 추출)")
                         else:
-                            st.warning(f"v{info['version']} 이미 존재 (스킵)")
+                            st.warning(f"v{info['version']} 이미 존재")
                     except Exception as e:
-                        st.error(f"처리 중 에러: {e}")
+                        st.error(f"오류: {e}")
                 st.rerun()
-            else:
-                st.warning("파일을 먼저 선택해주세요.")
 
     with st.expander("🗑️ 데이터 삭제"):
         if not hist_df.empty:
@@ -201,8 +185,8 @@ with st.sidebar:
                 conn.commit()
                 st.rerun()
 
-# --- 5. 메인 화면 렌더링 ---
-st.title("🛡️ TrusGuard 통합 관제 (v35.4)")
+# --- 5. 메인 렌더링 ---
+st.title("🛡️ TrusGuard 통합 관제 (v35.5)")
 
 c1, c2 = st.columns([5,1], vertical_alignment="bottom")
 keyword = c1.text_input("검색어 입력", key=st.session_state.s_key)
@@ -212,55 +196,39 @@ if c2.button("🔄 초기화"):
 
 def render_report_card(version, openssl, openssh, content, search_kws=None):
     st.markdown(f"<div class='version-header'>📦 TrusGuard {version}</div>", unsafe_allow_html=True)
-    
     with st.container():
         st.markdown("<div class='report-box'>", unsafe_allow_html=True)
-        
-        # 보안 컴포넌트
         st.markdown(f"<div class='meta-label'>🔒 보안 컴포넌트</div>", unsafe_allow_html=True)
         st.text(f"OpenSSL: {openssl} / OpenSSH: {openssh}")
         st.markdown("<br>", unsafe_allow_html=True)
 
-        # 상세 내용
         st.markdown(f"<div class='meta-label'>📋 상세 변경 내역</div>", unsafe_allow_html=True)
-        
         if content:
             paras = content.split('\n\n')
             has_content = False
             for p in paras:
                 if not p.strip(): continue
-                
                 display_text = p.strip()
-                
-                # 검색어 필터링
                 if search_kws:
-                    if not all(k.lower() in display_text.lower() for k in search_kws):
-                        continue
+                    if not all(k.lower() in display_text.lower() for k in search_kws): continue
                     for k in search_kws:
                         display_text = re.sub(f"({re.escape(k)})", r"<span class='highlight'>\1</span>", display_text, flags=re.I)
-                
-                # 하나라도 출력되면 플래그 세움
                 st.markdown(f"<div class='item-box'>{display_text}</div>", unsafe_allow_html=True)
                 has_content = True
             
             if not has_content and search_kws:
-                st.info("검색 조건에 맞는 상세 항목이 없습니다.")
+                st.info("검색 결과가 없습니다.")
         else:
-            st.warning("PDF에서 추출된 변경 내역이 없습니다. (파일 형식을 확인해주세요)")
-
+            st.warning("데이터 추출 실패: PDF 형식이 이미지거나 표 인식이 불가능합니다.")
         st.markdown("</div>", unsafe_allow_html=True)
 
 if keyword:
     kws = keyword.split()
     query = "SELECT * FROM notes WHERE " + " AND ".join(["raw_text LIKE ?" for _ in kws]) + " ORDER BY version DESC"
     res = pd.read_sql_query(query, conn, params=[f'%{k}%' for k in kws])
-    
-    if res.empty:
-        st.info("검색 결과가 없습니다.")
+    if res.empty: st.info("검색 결과 없음")
     else:
-        for _, row in res.iterrows():
-            render_report_card(row['version'], row['openssl'], row['openssh'], row['improvements'], kws)
-
+        for _, row in res.iterrows(): render_report_card(row['version'], row['openssl'], row['openssh'], row['improvements'], kws)
 elif sel_v:
     r = pd.read_sql_query("SELECT * FROM notes WHERE version = ?", conn, params=[sel_v]).iloc[0]
     render_report_card(r['version'], r['openssl'], r['openssh'], r['improvements'])
